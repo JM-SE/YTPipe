@@ -1,0 +1,31 @@
+# Architecture Snapshot Specification
+
+## Context
+Approved MVP architecture for a personal YouTube upload notifier. This snapshot is the implementation baseline and should not be treated as exploratory.
+
+## Requirements
+- [ ] Goal: notify the single user exactly once when a subscribed channel uploads a new video.
+- [ ] Constraints: no UI, single user, free-tier-friendly hosting, email-only notifications, polling-only detection.
+- [ ] Chosen stack: Python, FastAPI, SQLAlchemy, Alembic, PostgreSQL on Neon, Render hosting, Resend, external cron.
+- [ ] Detection uses the YouTube Data API uploads playlist path.
+- [ ] OAuth uses minimum required authentication and read scopes only.
+
+## Technical Approach
+Major components: FastAPI API, PostgreSQL persistence, Google OAuth token storage, subscription sync flow, protected polling endpoint, Resend email delivery, `/status` visibility, and external cron.
+
+Core runtime flow: authenticate -> sync subscriptions -> establish per-channel baseline -> cron calls `POST /internal/run-poll` -> quota gate -> sequential channel checks -> detect new video -> create delivery -> send email or mark retry state -> expose operational status.
+
+Operational assumptions: channels are processed sequentially in MVP, channel-level failures do not abort the run, quota safety stop can block runs before the real YouTube limit, and retry happens only on the next cycle.
+
+Frozen decisions: no Celery or Redis, no UI, no multi-user support, no extra notification channels, no change from uploads-playlist detection, and no persistence-model changes without approval.
+
+## Implementation Steps
+1. Use this snapshot as the approved architecture reference for implementation planning.
+2. Keep new implementation details inside the approved stack and flow boundaries.
+3. Treat frozen decisions as non-negotiable unless a later spec changes them.
+
+## Acceptance Criteria
+- [ ] The architecture snapshot names the approved stack and hosting choices.
+- [ ] The runtime flow includes auth, sync, polling, detection, delivery, and status visibility.
+- [ ] Sequential polling, partial-success handling, and quota gating are explicitly stated.
+- [ ] Frozen decisions align with the existing technical spec.
