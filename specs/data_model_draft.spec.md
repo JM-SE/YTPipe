@@ -15,7 +15,11 @@ OAuthAccount: stores Google OAuth credentials for the user; core fields `id`, `u
 
 Channel: canonical YouTube channel record; core fields `id`, `youtube_channel_id`, `title`, `uploads_playlist_id`, timestamps; unique `youtube_channel_id`.
 
-UserChannel: joins the user to monitored channels and stores per-user channel monitoring state; core fields `user_id`, `channel_id`, `is_monitored`, `last_seen_video_id`, `baseline_established_at`, timestamps; relationships to `User` and `Channel`; unique `(user_id, channel_id)`.
+UserChannel: joins the user to imported channels and stores per-user channel monitoring state; core fields `user_id`, `channel_id`, `is_monitored`, `last_seen_video_id`, `baseline_established_at`, timestamps; relationships to `User` and `Channel`; unique `(user_id, channel_id)`.
+
+`UserChannel.is_monitored` defaults to `false` when a subscription is imported into the catalog.
+
+`UserChannel.last_seen_video_id` and `UserChannel.baseline_established_at` are monitoring-state fields set when monitoring is activated or on the first poll after activation if baseline is still missing.
 
 Video: canonical detected video record; core fields `id`, `youtube_video_id`, `channel_id`, `title`, `published_at`, timestamps; relationship to `Channel`; `youtube_video_id` is globally unique.
 
@@ -25,11 +29,12 @@ SyncState: stores process-level operational state; core fields `id`, `user_id`, 
 
 ## Implementation Steps
 1. Translate each entity directly into ORM models without renaming the approved domain objects.
-2. Keep channel baseline state in `UserChannel` and process-level operational state in `SyncState`.
+2. Keep imported-channel and monitoring state in `UserChannel`, with baseline fields remaining unset until monitoring is activated.
 3. Enforce the stated uniqueness constraints at the database level.
 
 ## Acceptance Criteria
 - [ ] All seven approved entities are covered.
+- [ ] `UserChannel.is_monitored` defaults to `false` on import and baseline fields remain monitoring-state only.
 - [ ] `Video.youtube_video_id` is globally unique.
 - [ ] `NotificationDelivery` enforces `unique(user_id, video_id)`.
 - [ ] `SyncState` is defined as one record per process type with the three initial types.

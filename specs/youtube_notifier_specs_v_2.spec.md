@@ -35,7 +35,8 @@ Ensure the user receives exactly one notification per new video from subscribed 
 - Single user
 - Google OAuth authentication with minimum required auth and read scopes only
 - Import YouTube subscriptions
-- Monitor all channels by default
+- Internal MVP channel-management endpoints for listing imported channels and enabling or disabling monitoring
+- Monitor only channels explicitly enabled by the user
 - Polling-based detection via YouTube Data API using each channel's uploads playlist
 - Email notifications
 - Retry once on failure
@@ -66,16 +67,23 @@ Single technical user (owner of the system).
 ### 5.2 Subscription Sync
 1. Fetch subscriptions
 2. Store channels
-3. Enable monitoring by default
-4. On first sync, store the current latest visible upload as baseline only
-5. Do not notify for the initial baseline state
+3. Create or update a subscription catalog with monitoring disabled by default
+4. Do not establish per-channel baseline during full catalog sync
+5. Do not notify during catalog sync
 
-### 5.3 Polling Detection
+### 5.3 Channel Monitoring Management
+1. User calls internal MVP management endpoints
+2. System lists imported channels and current monitoring state
+3. User explicitly enables or disables monitoring per channel
+4. Enabling monitoring marks the channel eligible for polling
+5. Baseline is established when monitoring is enabled and first polled, with no notification for that baseline
+
+### 5.4 Polling Detection
 1. External cron triggers polling
-2. System checks each channel sequentially through the YouTube Data API uploads playlist path
+2. System checks only explicitly monitored channels sequentially through the YouTube Data API uploads playlist path
 3. Detects latest video
 
-### 5.4 Notification
+### 5.5 Notification
 1. New video detected
 2. Send email
 3. If the initial send fails with a transient error, mark the delivery `pending_retry`
@@ -87,7 +95,9 @@ Single technical user (owner of the system).
 ## 6. Business Rules
 
 - One notification per video
-- All channels monitored by default
+- Imported channels are not monitored by default
+- Only explicitly enabled channels are monitored
+- Baseline is established when monitoring is enabled and first polled
 - Polling interval is configurable
 - Polling uses a configurable internal daily quota budget and safety stop before the real YouTube quota limit
 - Poll runs are blocked when the internal quota budget is exhausted
@@ -182,7 +192,9 @@ cron → API → DB → detect → email
 ### UserChannel
 - user_id
 - channel_id
-- last_video_id
+- is_monitored
+- last_seen_video_id
+- baseline_established_at
 
 ### Video
 - id
@@ -216,6 +228,8 @@ cron → API → DB → detect → email
 
 ### Internal
 - POST /internal/run-poll (protected with `Authorization: Bearer <secret>`)
+- GET /internal/channels
+- PATCH /internal/channels/{channel_id}/monitoring (`{"is_monitored": true|false}`)
 - GET /status
 
 ---
@@ -223,14 +237,14 @@ cron → API → DB → detect → email
 ## 15. Polling Flow (Detailed)
 
 1. Triggered by cron if quota budget remains available
-2. Fetch monitored channels
+2. Fetch only explicitly monitored channels
 3. For each channel:
     - get latest upload from the channel uploads playlist
     - compare with stored sync state
     - process channels sequentially
     - if a channel fails, record the error and continue
 4. If no baseline exists:
-    - store the current latest visible video as baseline
+    - store the current latest visible video as baseline for that monitored channel
     - do not notify
 5. If new after baseline:
     - insert video
@@ -270,6 +284,7 @@ Effect:
 - store access token and refresh token
 - auto-refresh access token when possible
 - manual re-auth only if refresh token is unusable
+- OAuth callback must not synchronously perform full subscription import plus baseline establishment for all channels
 
 ---
 
@@ -281,6 +296,7 @@ Expose:
 - email: last send attempt, last successful send, last email failure
 - quota: configured daily budget, estimated current usage, whether safety stop is active
 - monitored channels count
+- imported channels list with per-channel monitoring state through internal MVP endpoints
 
 ---
 
@@ -318,10 +334,11 @@ Expose:
 
 1. Auth
 2. DB schema
-3. Sync
-4. Polling
-5. Email
-6. Cron
+3. Subscription catalog sync
+4. Channel monitoring management
+5. Polling
+6. Email
+7. Cron
 
 ---
 

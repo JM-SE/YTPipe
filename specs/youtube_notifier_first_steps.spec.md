@@ -16,10 +16,11 @@ Before implementation begins, confirm that the MVP scope is fixed to the followi
 - email as the only notification channel
 - polling as the only detection strategy for MVP, using the YouTube Data API uploads playlist path
 - external cron triggering the polling endpoint
-- all imported subscriptions monitored by default
+- all imported subscriptions stored in a catalog but not monitored by default
+- only explicitly enabled channels monitored in MVP
 - one retry for transient failed email delivery only
 - free-tier-friendly deployment
-- initial sync establishes a baseline only and does not backfill notifications
+- baseline established only when monitoring is enabled for a channel and first polled
 
 ### Expected output
 A short explicit confirmation that the above scope is the current MVP contract.
@@ -82,6 +83,7 @@ The contract should clarify:
 - endpoint: `POST /internal/run-poll`
 - protected with `Authorization: Bearer <secret>`
 - processes all monitored channels for the single user
+- monitored channels come only from explicit per-channel activation, not from raw subscription import
 - processes channels sequentially in MVP
 - compares current latest upload from the channel uploads playlist against stored state
 - creates a notification attempt only when a new video is detected
@@ -119,6 +121,8 @@ At minimum, the following entities should be confirmed:
 - `Video.youtube_video_id` is globally unique
 - `NotificationDelivery` enforces `unique(user_id, video_id)`
 - `SyncState` stores one record per process type, with initial types `subscription_sync`, `polling`, and `quota`
+- `UserChannel.is_monitored` defaults to `false` on subscription import
+- `UserChannel.baseline_established_at` and `UserChannel.last_seen_video_id` are monitoring-state fields set when monitoring is activated or first polled after activation
 
 ### Important note
 The agent should not invent or rename core entities without explicit approval.
@@ -188,7 +192,7 @@ Clarify:
 - whether re-auth is manual
 
 ### MVP assumption
-Single Google account. Use only the minimum required authentication and read scopes, store access token and refresh token, auto-renew the access token, and require manual re-auth only if the refresh token becomes invalid or unusable.
+Single Google account. Use only the minimum required authentication and read scopes, store access token and refresh token, auto-renew the access token, and require manual re-auth only if the refresh token becomes invalid or unusable. The OAuth callback must complete token persistence and may trigger lightweight sync metadata, but it must not synchronously perform full catalog import plus per-channel baseline establishment.
 
 ### Expected output
 A short auth flow note with scope and token handling boundaries.
@@ -206,6 +210,7 @@ Define what must be visible through logs or status endpoint:
 - email: last send attempt, last successful send, last email failure
 - quota: configured daily budget, estimated current usage, whether safety stop is active
 - general: monitored channels count
+- channel management: imported channels list and current `is_monitored` state through internal MVP endpoints
 
 ### Expected output
 A small operational checklist for logs and `/status` endpoint behavior.

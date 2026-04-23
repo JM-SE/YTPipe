@@ -12,16 +12,18 @@
 
 ## Phases
 1. `01_foundations.spec.md` - Establish project skeleton, configuration contract, database connectivity, Alembic, base models, app startup, and a minimal health/status placeholder.
-2. `02_auth_and_subscription_import.spec.md` - Add Google OAuth, token persistence, minimum-scope policy, token refresh contract, and initial subscription import with baseline-only monitoring records.
-3. `03_polling_core.spec.md` - Implement protected polling entrypoint, quota safety gate, sequential channel polling, baseline/new-video handling, sync state updates, and partial-success run semantics.
-4. `04_notifications.spec.md` - Add Resend delivery path, notification state transitions, and next-cycle retry pickup behavior.
-5. `05_hardening.spec.md` - Enforce deduplication, idempotent and transactional behavior, error recording, `/status` contract, and observability coverage.
-6. `06_deployment_readiness.spec.md` - Finalize environment contract, deployment assumptions, production-safe checks, smoke tests, and free-tier operating guidance.
+2. `02_auth_and_subscription_import.spec.md` - Add Google OAuth, token persistence, minimum-scope policy, token refresh contract, and subscription catalog sync without mass baseline establishment.
+3. `02a_channel_monitoring_management.spec.md` - Add internal MVP endpoints to list imported channels and explicitly enable or disable monitoring per channel.
+4. `03_polling_core.spec.md` - Implement protected polling entrypoint, quota safety gate, sequential polling of monitored channels only, baseline/new-video handling, sync state updates, and partial-success run semantics.
+5. `04_notifications.spec.md` - Add Resend delivery path, notification state transitions, and next-cycle retry pickup behavior.
+6. `05_hardening.spec.md` - Enforce deduplication, idempotent and transactional behavior, error recording, `/status` contract, and observability coverage.
+7. `06_deployment_readiness.spec.md` - Finalize environment contract, deployment assumptions, production-safe checks, smoke tests, and free-tier operating guidance.
 
 ## Dependencies
 - Phase 1 is required before all other phases.
 - Phase 2 depends on the Phase 1 app, DB, and migration baseline.
-- Phase 3 depends on Phase 2 channel data, OAuth persistence, and subscription-import baseline records.
+- Phase 2a depends on Phase 2 catalog data and OAuth-backed channel records.
+- Phase 3 depends on Phase 2a monitored-channel state and Phase 2 OAuth persistence.
 - Phase 4 depends on Phase 3 creating `Video` and `NotificationDelivery` records during poll processing.
 - Phase 5 depends on Phases 3 and 4 so hardening validates the real poll and delivery flow rather than placeholders.
 - Phase 6 depends on all prior phases meeting acceptance so deployment work reflects the actual implemented contract.

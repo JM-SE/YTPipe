@@ -9,10 +9,10 @@ Step-by-step MVP execution flow for `POST /internal/run-poll`.
 ## Technical Approach
 1. Accept only `POST /internal/run-poll` requests with `Authorization: Bearer <secret>`.
 2. Check the internal quota budget and safety stop before any polling work; if blocked, end the run without channel processing.
-3. Load monitored channels for the single user.
+3. Load only explicitly monitored channels for the single user.
 4. Process channels sequentially in MVP.
 5. For each channel, read the latest upload from the channel uploads playlist.
-6. If no baseline exists for that channel, store the current latest visible video as baseline and do not notify.
+6. If a monitored channel has no baseline yet, store the current latest visible video as baseline, set monitoring-state fields, and do not notify.
 7. If the latest upload matches stored state, do nothing for that channel.
 8. If a new video is detected after baseline, persist the canonical `Video` record, create or confirm the `NotificationDelivery` record, attempt the email send, and update channel state.
 9. During the same run, pick up any deliveries already marked `pending_retry` and attempt their one allowed retry.
@@ -21,12 +21,13 @@ Step-by-step MVP execution flow for `POST /internal/run-poll`.
 
 ## Implementation Steps
 1. Treat quota gating as the first execution guard.
-2. Keep channel detection and retry pickup inside one polling cycle contract.
+2. Do not assume subscription import already established baseline; keep baseline establishment inside the polling contract for monitored channels.
 3. Record aggregate run status and per-channel errors for `/status` visibility.
 
 ## Acceptance Criteria
 - [ ] The endpoint contract includes bearer protection.
 - [ ] Channel processing is explicitly sequential.
+- [ ] Polling loads only explicitly monitored channels.
 - [ ] Baseline establishment does not create notifications.
 - [ ] Channel-level failures do not abort the full run.
 - [ ] Final run outcomes include success, partial success, and failed semantics.
