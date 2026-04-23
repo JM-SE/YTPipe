@@ -6,6 +6,7 @@ This phase makes the implemented MVP safe to run unattended within the approved 
 ## Requirements
 - [ ] Enforce deduplication constraints and idempotent write behavior across detection and delivery flows.
 - [ ] Ensure transactional behavior for state updates that must stay consistent.
+- [ ] Require a hardening-phase schema smoke test that verifies the expected core tables and key uniqueness constraints remain present at the DB level.
 - [ ] Record robust channel, run, and delivery errors for operational visibility.
 - [ ] Define the full `/status` response contract for MVP observability.
 - [ ] Validate partial-failure behavior so useful work is preserved when individual channels or deliveries fail.
@@ -17,15 +18,17 @@ Use database constraints from `specs/data_model_draft.spec.md` and retry/idempot
 
 ## Implementation Steps
 1. Validate all uniqueness constraints and upsert-or-confirm patterns used by polling and notification flows.
-2. Add transactional boundaries so partially completed writes do not create inconsistent notification state.
-3. Persist structured error details for subscription sync, polling runs, channel failures, quota blocks, and delivery failures.
-4. Implement the approved `/status` contract for sync, polling, email, quota, and monitored-channel visibility.
-5. Verify that partial-failure scenarios preserve successful work and surface accurate aggregate status.
-6. End the phase with a local testing handoff that explains how to verify deduplication, error visibility, and `/status` locally, plus a short manual checklist and any stated gap for non-local verification.
+2. Run a schema smoke test against the target database to confirm the expected core tables still exist and that `Video.youtube_video_id` global uniqueness and `NotificationDelivery unique(user_id, video_id)` are enforced at the DB level.
+3. Add transactional boundaries so partially completed writes do not create inconsistent notification state.
+4. Persist structured error details for subscription sync, polling runs, channel failures, quota blocks, and delivery failures.
+5. Implement the approved `/status` contract for sync, polling, email, quota, and monitored-channel visibility.
+6. Verify that partial-failure scenarios preserve successful work and surface accurate aggregate status.
+7. End the phase with a local testing handoff that explains how to verify deduplication, schema smoke coverage, error visibility, and `/status` locally, plus a short manual checklist and any stated gap for non-local verification.
 
 ## Acceptance Criteria
 - [ ] Re-detecting the same YouTube video cannot create duplicate canonical video rows or duplicate user delivery rows.
 - [ ] Polling and delivery writes are idempotent enough to tolerate safe re-entry after recoverable failures.
+- [ ] A schema smoke test verifies the expected core tables remain present and confirms DB-level enforcement of `Video.youtube_video_id` global uniqueness and `NotificationDelivery unique(user_id, video_id)`.
 - [ ] `/status` exposes last sync result, polling result, delivery result, quota state, and monitored channel count.
 - [ ] Channel or email failures are recorded with enough detail to diagnose the failing step.
 - [ ] Partial-failure runs preserve successful channel outcomes while clearly reporting failed ones.
