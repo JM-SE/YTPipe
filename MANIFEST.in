@@ -1,0 +1,3 @@
+include alembic.ini
+include .env.example
+recursive-include alembic *

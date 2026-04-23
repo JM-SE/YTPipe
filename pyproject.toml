@@ -1,0 +1,36 @@
+[project]
+name = "ytpipe"
+version = "0.1.0"
+description = "YouTube Notifier MVP foundations"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "alembic>=1.16.0,<2.0.0",
+    "fastapi>=0.116.0,<1.0.0",
+    "psycopg[binary]>=3.2.0,<4.0.0",
+    "pydantic-settings>=2.10.0,<3.0.0",
+    "sqlalchemy>=2.0.43,<3.0.0",
+    "uvicorn>=0.35.0,<1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28.0,<1.0.0",
+    "pytest>=8.4.0,<9.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=80.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools.data-files]
+"." = ["alembic.ini", ".env.example"]
+"alembic" = ["alembic/README", "alembic/env.py", "alembic/script.py.mako"]
+"alembic/versions" = ["alembic/versions/20260422_0001_foundations_baseline.py"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
