@@ -6,12 +6,14 @@ Requires-Python: >=3.13
 Description-Content-Type: text/markdown
 Requires-Dist: alembic<2.0.0,>=1.16.0
 Requires-Dist: fastapi<1.0.0,>=0.116.0
+Requires-Dist: google-api-python-client<3.0.0,>=2.170.0
+Requires-Dist: google-auth-oauthlib<2.0.0,>=1.2.0
+Requires-Dist: httpx<1.0.0,>=0.28.0
 Requires-Dist: psycopg[binary]<4.0.0,>=3.2.0
 Requires-Dist: pydantic-settings<3.0.0,>=2.10.0
 Requires-Dist: sqlalchemy<3.0.0,>=2.0.43
 Requires-Dist: uvicorn<1.0.0,>=0.35.0
 Provides-Extra: dev
-Requires-Dist: httpx<1.0.0,>=0.28.0; extra == "dev"
 Requires-Dist: pytest<9.0.0,>=8.4.0; extra == "dev"
 
 # YTPipe

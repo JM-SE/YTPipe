@@ -4,6 +4,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.settings import get_settings
+from app.db import base  # noqa: F401
 
 settings = get_settings()
 

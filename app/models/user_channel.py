@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint, true
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint, false
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base_class import Base, TimestampMixin
@@ -15,8 +15,8 @@ class UserChannel(TimestampMixin, Base):
     channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
     is_monitored: Mapped[bool] = mapped_column(
         Boolean,
-        default=True,
-        server_default=true(),
+        default=False,
+        server_default=false(),
         nullable=False,
     )
     last_seen_video_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
