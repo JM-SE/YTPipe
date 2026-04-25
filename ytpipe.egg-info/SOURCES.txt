@@ -21,6 +21,7 @@ app/api/routes/__init__.py
 app/api/routes/auth.py
 app/api/routes/channels.py
 app/api/routes/health.py
+app/api/routes/polling.py
 app/api/routes/status.py
 app/api/routes/subscriptions.py
 app/core/__init__.py
@@ -40,10 +41,12 @@ app/models/user_channel.py
 app/models/video.py
 app/services/__init__.py
 app/services/auth.py
+app/services/polling.py
 app/services/subscriptions.py
 specs/architecture_snapshot.spec.md
 tests/test_app.py
 tests/test_auth_and_import.py
+tests/test_polling_core.py
 ytpipe.egg-info/PKG-INFO
 ytpipe.egg-info/SOURCES.txt
 ytpipe.egg-info/dependency_links.txt

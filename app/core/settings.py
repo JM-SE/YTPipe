@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     app_port: int = Field(default=8000, alias="APP_PORT")
     app_secret_key: str = Field(default="replace-me", alias="APP_SECRET_KEY")
     internal_api_bearer_token: str = Field(default="replace-me-internal", alias="INTERNAL_API_BEARER_TOKEN")
+    poll_quota_daily_budget: int = Field(default=500, alias="POLL_QUOTA_DAILY_BUDGET")
+    poll_quota_safety_stop_enabled: bool = Field(default=True, alias="POLL_QUOTA_SAFETY_STOP_ENABLED")
     database_url: str = Field(
         default="postgresql+psycopg://postgres:postgres@localhost:5432/ytpipe",
         alias="DATABASE_URL",

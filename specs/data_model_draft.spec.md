@@ -27,6 +27,8 @@ NotificationDelivery: tracks email delivery state for a user-video pair; core fi
 
 SyncState: stores process-level operational state; core fields `id`, `user_id`, `process_type`, `last_success_at`, `last_error_at`, `last_error_message`, `metadata`, timestamps; one record per process type for the user; initial `process_type` values: `subscription_sync`, `polling`, `quota`; unique `(user_id, process_type)`.
 
+For MVP, `SyncState` `metadata` remains lightweight. The `quota` record is sufficient when it carries simple operational visibility such as configured daily budget, estimated units used today, last run estimated units, and whether the safety stop is active or was triggered.
+
 ## Implementation Steps
 1. Translate each entity directly into ORM models without renaming the approved domain objects.
 2. Keep imported-channel and monitoring state in `UserChannel`, with baseline fields remaining unset until monitoring is activated.
@@ -38,3 +40,4 @@ SyncState: stores process-level operational state; core fields `id`, `user_id`, 
 - [ ] `Video.youtube_video_id` is globally unique.
 - [ ] `NotificationDelivery` enforces `unique(user_id, video_id)`.
 - [ ] `SyncState` is defined as one record per process type with the three initial types.
+- [ ] `SyncState.metadata` is explicitly allowed to hold lightweight MVP quota visibility for the `quota` process type.
