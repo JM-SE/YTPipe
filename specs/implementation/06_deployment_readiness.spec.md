@@ -12,6 +12,8 @@ This phase prepares the MVP for the approved free-tier deployment model. Authori
 - [ ] Defer real Resend setup until before production final.
 - [ ] Add production-safe configuration checks before unattended operation.
 - [ ] Provide a smoke-test checklist for first deploy and post-change verification.
+- [ ] Include protected developer API docs verification for staging and production per `specs/implementation/06a_protected_api_docs.spec.md`.
+- [ ] Include staging runtime reliability follow-up for Render + Neon stale connection handling per `specs/implementation/06b_database_connection_resilience.spec.md`.
 - [ ] Require a packaging/distribution smoke check that confirms the built artifact contains the runtime and migration files needed for operation.
 - [ ] Document free-tier operational concerns relevant to the approved MVP.
 - [ ] In scope: env contract, deployment assumptions, startup/config validation expectations, smoke-test checklist, operational cautions.
@@ -24,7 +26,9 @@ Use a versioned `render.yaml` / Render Blueprint for service shape, plan, build 
 
 Alembic migrations are manual. After Render/Neon env is configured, run `python -m alembic upgrade head` with the staging or production `DATABASE_URL` set. Neon `DATABASE_URL` must use the psycopg SQLAlchemy format and SSL where required, typically `postgresql+psycopg://...?...sslmode=require` or the equivalent Neon-provided URL adapted for SQLAlchemy.
 
-Keep `/health` public for uptime checks. Use bearer-protected `/status` for operational validation. cron-job.org should eventually call `POST /internal/run-poll` with `Authorization: Bearer <INTERNAL_API_BEARER_TOKEN>` only after staging endpoint validation. Google OAuth redirect URI for Render must be `https://<render-service-host>/auth/callback` and must be added in Google Cloud Console.
+Keep `/health` public for uptime checks. Use bearer-protected `/status` for operational validation. In staging and production, FastAPI Swagger UI, OpenAPI JSON, and ReDoc must also require the same internal bearer token; local docs may remain public. cron-job.org should eventually call `POST /internal/run-poll` with `Authorization: Bearer <INTERNAL_API_BEARER_TOKEN>` only after staging endpoint validation. Google OAuth redirect URI for Render must be `https://<render-service-host>/auth/callback` and must be added in Google Cloud Console.
+
+Staging runtime reliability follow-up: the first cron-job.org call reached `POST /internal/run-poll` on Render but failed before OAuth/YouTube/polling logic on the first database query with Neon/Postgres `AdminShutdown` wrapped as SQLAlchemy `OperationalError`. Treat this as a stale/closed deployed database connection issue and resolve under `specs/implementation/06b_database_connection_resilience.spec.md`, not as cron authentication or OAuth scope failure.
 
 Environment variable contract:
 
@@ -54,7 +58,8 @@ Staging expectations: `APP_ENV=staging`, `EMAIL_DELIVERY_MODE=fake`, valid Rende
 5. Document the manual migration command `python -m alembic upgrade head` with the target Neon `DATABASE_URL` set.
 6. Write a concise smoke-test checklist covering startup, DB migration, auth, import, poll, status, and email delivery.
 7. Capture free-tier concerns such as cold starts, cron overlap avoidance, quota budget tuning, and provider reliability checks.
-8. End the phase with a local testing handoff that explains which deployment-readiness checks can be exercised locally, includes a short manual checklist, and names any missing deployment prerequisite for the rest.
+8. Track the approved staging database connection resilience follow-up in `06b_database_connection_resilience.spec.md`.
+9. End the phase with a local testing handoff that explains which deployment-readiness checks can be exercised locally, includes a short manual checklist, and names any missing deployment prerequisite for the rest.
 
 Staging smoke checklist:
 
@@ -62,12 +67,15 @@ Staging smoke checklist:
 2. `/health` public endpoint works.
 3. `/status` without bearer fails.
 4. `/status` with bearer works.
-5. DB migrations are applied.
-6. Google OAuth callback works using the Render redirect URI.
-7. Subscription sync protected endpoint works.
-8. Channel listing/toggle protected endpoints work.
-9. `POST /internal/run-poll` works with fake email.
-10. cron-job.org is configured only after manual endpoint validation.
+5. Swagger UI, OpenAPI JSON, and ReDoc reject missing or wrong bearer tokens.
+6. Swagger UI, OpenAPI JSON, and ReDoc work with the correct bearer token.
+7. OpenAPI declares HTTP bearer auth and Swagger UI Authorize can call protected endpoints.
+8. DB migrations are applied.
+9. Google OAuth callback works using the Render redirect URI.
+10. Subscription sync protected endpoint works.
+11. Channel listing/toggle protected endpoints work.
+12. `POST /internal/run-poll` works with fake email.
+13. cron-job.org is configured only after manual endpoint validation.
 
 ## Acceptance Criteria
 - [ ] The spec names the required environment variables and their operational purpose.
@@ -79,5 +87,7 @@ Staging smoke checklist:
 - [ ] Production startup is required to fail clearly when critical configuration is missing or unsafe.
 - [ ] A packaging/distribution smoke check requires the built artifact to include the app package, `alembic/`, and `alembic.ini`.
 - [ ] A smoke-test checklist exists for verifying the deployed MVP end to end.
+- [ ] Staging and production smoke checks verify protected Swagger UI, OpenAPI JSON, and ReDoc access while confirming local docs remain public per `06a_protected_api_docs.spec.md`.
+- [ ] Staging runtime reliability includes the approved Render + Neon stale connection follow-up per `06b_database_connection_resilience.spec.md`.
 - [ ] Free-tier operational concerns are called out without expanding the product scope.
 - [ ] Phase completion includes a required local testing handoff that separates local checks from deployment-only checks and states the exact missing prerequisite for anything not locally testable.

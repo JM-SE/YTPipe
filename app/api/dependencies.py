@@ -5,10 +5,7 @@ from fastapi import Depends, Header, HTTPException, status
 from app.core.settings import Settings, get_settings
 
 
-def require_internal_bearer_token(
-    authorization: str | None = Header(default=None),
-    settings: Settings = Depends(get_settings),
-) -> None:
+def validate_internal_bearer_token(authorization: str | None, settings: Settings) -> None:
     expected = settings.internal_api_bearer_token
     if not expected or expected == "replace-me-internal":
         raise HTTPException(
@@ -21,3 +18,10 @@ def require_internal_bearer_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid internal bearer token.",
         )
+
+
+def require_internal_bearer_token(
+    authorization: str | None = Header(default=None),
+    settings: Settings = Depends(get_settings),
+) -> None:
+    validate_internal_bearer_token(authorization, settings)

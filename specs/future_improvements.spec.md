@@ -26,6 +26,7 @@ Deferred items:
 - Celery, Redis, or background workers only as future explicitly approved architecture, not MVP infrastructure.
 - Stronger token protection and encryption-at-rest for OAuth credentials.
 - Richer observability and alerting beyond `/status`.
+- Broader database resilience and observability beyond the approved MVP `pool_pre_ping`/connection recycle follow-up in `specs/implementation/06b_database_connection_resilience.spec.md`.
 
 ## Implementation Steps
 

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from app.core.settings import Settings
+from app.db.session import get_engine_kwargs
 
 
 def test_staging_runtime_config_accepts_fake_email_with_safe_secrets() -> None:
@@ -20,6 +21,34 @@ def test_staging_runtime_config_accepts_fake_email_with_safe_secrets() -> None:
     )
 
     settings.validate_runtime_config()
+
+
+def test_database_engine_uses_pre_ping_and_recycles_non_local_connections() -> None:
+    settings = Settings(
+        APP_ENV="staging",
+        APP_SECRET_KEY="staging-secret",
+        INTERNAL_API_BEARER_TOKEN="staging-internal-token",
+        DATABASE_URL="postgresql+psycopg://user:password@example.neon.tech/ytpipe?sslmode=require",
+        GOOGLE_CLIENT_ID="google-client-id",
+        GOOGLE_CLIENT_SECRET="google-client-secret",
+        GOOGLE_REDIRECT_URI="https://ytpipe-staging.onrender.com/auth/callback",
+        EMAIL_DELIVERY_MODE="fake",
+    )
+
+    assert get_engine_kwargs(settings) == {
+        "future": True,
+        "pool_pre_ping": True,
+        "pool_recycle": 300,
+    }
+
+
+def test_database_engine_keeps_local_connection_config_minimal() -> None:
+    settings = Settings(APP_ENV="local")
+
+    assert get_engine_kwargs(settings) == {
+        "future": True,
+        "pool_pre_ping": True,
+    }
 
 
 def test_non_local_runtime_config_rejects_placeholder_secrets() -> None:
