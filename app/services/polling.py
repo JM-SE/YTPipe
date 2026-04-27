@@ -102,6 +102,7 @@ class YouTubePollingService:
         new_videos_detected = 0
         channel_errors: list[dict[str, Any]] = []
 
+        self._process_pending_initial_deliveries(session, user)
         self._process_pending_retry_deliveries(session, user)
 
         for user_channel, channel in monitored_rows:
@@ -273,6 +274,28 @@ class YouTubePollingService:
                 channel=channel,
                 video=video,
                 is_retry=True,
+            )
+
+    def _process_pending_initial_deliveries(self, session: Session, user: User) -> None:
+        pending_rows = session.execute(
+            select(NotificationDelivery, Video, Channel)
+            .join(Video, NotificationDelivery.video_id == Video.id)
+            .join(Channel, Video.channel_id == Channel.id)
+            .where(
+                NotificationDelivery.user_id == user.id,
+                NotificationDelivery.status == DEFAULT_DELIVERY_STATUS,
+                NotificationDelivery.attempt_count == 0,
+            )
+            .order_by(NotificationDelivery.id.asc())
+        ).all()
+
+        for delivery, video, channel in pending_rows:
+            self._attempt_delivery_send(
+                delivery=delivery,
+                user=user,
+                channel=channel,
+                video=video,
+                is_retry=False,
             )
 
     def _attempt_initial_delivery_send(

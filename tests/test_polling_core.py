@@ -981,6 +981,109 @@ def test_run_poll_retries_pending_retry_once_and_marks_delivered(db_session, mon
     assert refreshed.last_error is None
 
 
+def test_run_poll_processes_existing_pending_delivery_without_new_video(db_session, monkeypatch) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        POLL_QUOTA_DAILY_BUDGET=50,
+        POLL_QUOTA_SAFETY_STOP_ENABLED=True,
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+        EMAIL_DELIVERY_MODE="fake",
+    )
+
+    user = User(email="owner@example.com")
+    channel = Channel(youtube_channel_id="channel-a", title="A", uploads_playlist_id="uploads-a")
+    db_session.add_all([user, channel])
+    db_session.flush()
+
+    video = Video(
+        youtube_video_id="video-already-seen",
+        channel_id=channel.id,
+        title="Already Seen Video",
+        published_at=datetime.now(UTC),
+    )
+    db_session.add(video)
+    db_session.flush()
+
+    db_session.add(
+        UserChannel(
+            user_id=user.id,
+            channel_id=channel.id,
+            is_monitored=True,
+            last_seen_video_id="video-already-seen",
+            baseline_established_at=datetime.now(UTC) - timedelta(days=1),
+        )
+    )
+    db_session.add(
+        NotificationDelivery(
+            user_id=user.id,
+            video_id=video.id,
+            status="pending",
+            attempt_count=0,
+        )
+    )
+    db_session.add(
+        OAuthAccount(
+            user_id=user.id,
+            provider="google",
+            access_token="token",
+            refresh_token="refresh",
+            token_expiry=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        polling_module.GoogleOAuthService,
+        "ensure_valid_credentials",
+        lambda self, session, oauth_account: object(),  # noqa: ARG005
+    )
+
+    class FakeRequest:
+        def execute(self):
+            return {
+                "items": [
+                    {
+                        "snippet": {"title": "Already Seen Video", "publishedAt": "2026-04-25T12:00:00Z"},
+                        "contentDetails": {"videoId": "video-already-seen"},
+                    }
+                ]
+            }
+
+    class FakePlaylistItemsResource:
+        def list(self, **kwargs):  # noqa: ARG002
+            return FakeRequest()
+
+    class FakeYouTube:
+        def playlistItems(self):
+            return FakePlaylistItemsResource()
+
+    monkeypatch.setattr(polling_module, "build", lambda *args, **kwargs: FakeYouTube())
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.post(
+            "/internal/run-poll",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["new_videos_detected"] == 0
+
+    delivery = db_session.query(NotificationDelivery).one()
+    assert delivery.status == "delivered"
+    assert delivery.attempt_count == 1
+    assert delivery.last_attempt_at is not None
+    assert delivery.last_error is None
+
+
 def test_run_poll_failed_retry_marks_delivery_failed(db_session, monkeypatch) -> None:
     client = TestClient(app)
     settings = Settings(
