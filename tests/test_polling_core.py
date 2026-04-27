@@ -19,6 +19,7 @@ from app.models.sync_state import SyncState
 from app.models.user import User
 from app.models.user_channel import UserChannel
 from app.models.video import Video
+from app.services.email import EmailDeliveryAttemptError
 from app.services.polling import POLLING_PROCESS, QUOTA_PROCESS
 
 
@@ -318,7 +319,10 @@ def test_run_poll_new_video_creates_video_and_delivery(db_session, monkeypatch) 
     assert video.title == "Brand New Video"
     assert delivery.user_id == user.id
     assert delivery.video_id == video.id
-    assert delivery.status == "pending"
+    assert delivery.status == "delivered"
+    assert delivery.attempt_count == 1
+    assert delivery.last_attempt_at is not None
+    assert delivery.last_error is None
 
 
 def test_run_poll_unchanged_latest_video_is_noop(db_session, monkeypatch) -> None:
@@ -719,3 +723,383 @@ def test_run_poll_response_is_aggregate_only(db_session, monkeypatch) -> None:
         ]
     )
     assert "channel_errors" not in payload
+
+
+def test_run_poll_retryable_initial_email_failure_marks_pending_retry(db_session, monkeypatch) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        POLL_QUOTA_DAILY_BUDGET=50,
+        POLL_QUOTA_SAFETY_STOP_ENABLED=True,
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+        EMAIL_DELIVERY_MODE="fake",
+    )
+
+    user = User(email="owner@example.com")
+    channel = Channel(youtube_channel_id="channel-a", title="A", uploads_playlist_id="uploads-a")
+    db_session.add_all([user, channel])
+    db_session.flush()
+    db_session.add(
+        UserChannel(
+            user_id=user.id,
+            channel_id=channel.id,
+            is_monitored=True,
+            last_seen_video_id="video-old",
+            baseline_established_at=datetime.now(UTC) - timedelta(days=1),
+        )
+    )
+    db_session.add(
+        OAuthAccount(
+            user_id=user.id,
+            provider="google",
+            access_token="token",
+            refresh_token="refresh",
+            token_expiry=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        polling_module.GoogleOAuthService,
+        "ensure_valid_credentials",
+        lambda self, session, oauth_account: object(),  # noqa: ARG005
+    )
+
+    class FakeRequest:
+        def execute(self):
+            return {
+                "items": [
+                    {
+                        "snippet": {"title": "Brand New Video", "publishedAt": "2026-04-25T12:00:00Z"},
+                        "contentDetails": {"videoId": "video-new"},
+                    }
+                ]
+            }
+
+    class FakePlaylistItemsResource:
+        def list(self, **kwargs):  # noqa: ARG002
+            return FakeRequest()
+
+    class FakeYouTube:
+        def playlistItems(self):
+            return FakePlaylistItemsResource()
+
+    monkeypatch.setattr(polling_module, "build", lambda *args, **kwargs: FakeYouTube())
+
+    def fake_send_failure(self, payload):  # noqa: ANN001, ARG001
+        raise EmailDeliveryAttemptError("transient email error", retryable=True)
+
+    monkeypatch.setattr(polling_module.EmailDeliveryService, "send_video_notification", fake_send_failure)
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.post(
+            "/internal/run-poll",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+
+    delivery = db_session.query(NotificationDelivery).one()
+    assert delivery.status == "pending_retry"
+    assert delivery.attempt_count == 1
+    assert delivery.last_attempt_at is not None
+    assert delivery.last_error == "transient email error"
+
+
+def test_run_poll_permanent_initial_email_failure_marks_failed(db_session, monkeypatch) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        POLL_QUOTA_DAILY_BUDGET=50,
+        POLL_QUOTA_SAFETY_STOP_ENABLED=True,
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+        EMAIL_DELIVERY_MODE="fake",
+    )
+
+    user = User(email="owner@example.com")
+    channel = Channel(youtube_channel_id="channel-a", title="A", uploads_playlist_id="uploads-a")
+    db_session.add_all([user, channel])
+    db_session.flush()
+    db_session.add(
+        UserChannel(
+            user_id=user.id,
+            channel_id=channel.id,
+            is_monitored=True,
+            last_seen_video_id="video-old",
+            baseline_established_at=datetime.now(UTC) - timedelta(days=1),
+        )
+    )
+    db_session.add(
+        OAuthAccount(
+            user_id=user.id,
+            provider="google",
+            access_token="token",
+            refresh_token="refresh",
+            token_expiry=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        polling_module.GoogleOAuthService,
+        "ensure_valid_credentials",
+        lambda self, session, oauth_account: object(),  # noqa: ARG005
+    )
+
+    class FakeRequest:
+        def execute(self):
+            return {
+                "items": [
+                    {
+                        "snippet": {"title": "Brand New Video", "publishedAt": "2026-04-25T12:00:00Z"},
+                        "contentDetails": {"videoId": "video-new"},
+                    }
+                ]
+            }
+
+    class FakePlaylistItemsResource:
+        def list(self, **kwargs):  # noqa: ARG002
+            return FakeRequest()
+
+    class FakeYouTube:
+        def playlistItems(self):
+            return FakePlaylistItemsResource()
+
+    monkeypatch.setattr(polling_module, "build", lambda *args, **kwargs: FakeYouTube())
+
+    def fake_send_failure(self, payload):  # noqa: ANN001, ARG001
+        raise EmailDeliveryAttemptError("invalid recipient", retryable=False)
+
+    monkeypatch.setattr(polling_module.EmailDeliveryService, "send_video_notification", fake_send_failure)
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.post(
+            "/internal/run-poll",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+
+    delivery = db_session.query(NotificationDelivery).one()
+    assert delivery.status == "failed"
+    assert delivery.attempt_count == 1
+    assert delivery.last_attempt_at is not None
+    assert delivery.last_error == "invalid recipient"
+
+
+def test_run_poll_retries_pending_retry_once_and_marks_delivered(db_session, monkeypatch) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        POLL_QUOTA_DAILY_BUDGET=50,
+        POLL_QUOTA_SAFETY_STOP_ENABLED=True,
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+        EMAIL_DELIVERY_MODE="fake",
+    )
+
+    user = User(email="owner@example.com")
+    channel = Channel(youtube_channel_id="channel-a", title="A", uploads_playlist_id="uploads-a")
+    db_session.add_all([user, channel])
+    db_session.flush()
+
+    video = Video(
+        youtube_video_id="video-a",
+        channel_id=channel.id,
+        title="Video A",
+        published_at=datetime.now(UTC),
+    )
+    db_session.add(video)
+    db_session.flush()
+
+    delivery = NotificationDelivery(
+        user_id=user.id,
+        video_id=video.id,
+        status="pending_retry",
+        attempt_count=1,
+        last_error="timeout",
+    )
+    db_session.add(delivery)
+    db_session.add(
+        OAuthAccount(
+            user_id=user.id,
+            provider="google",
+            access_token="token",
+            refresh_token="refresh",
+            token_expiry=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        polling_module.GoogleOAuthService,
+        "ensure_valid_credentials",
+        lambda self, session, oauth_account: object(),  # noqa: ARG005
+    )
+
+    class FakeYouTube:
+        def playlistItems(self):  # pragma: no cover
+            raise AssertionError("No monitored channels should be polled in this test")
+
+    monkeypatch.setattr(polling_module, "build", lambda *args, **kwargs: FakeYouTube())
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.post(
+            "/internal/run-poll",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+
+    refreshed = db_session.query(NotificationDelivery).one()
+    assert refreshed.status == "delivered"
+    assert refreshed.attempt_count == 2
+    assert refreshed.last_attempt_at is not None
+    assert refreshed.last_error is None
+
+
+def test_run_poll_failed_retry_marks_delivery_failed(db_session, monkeypatch) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        POLL_QUOTA_DAILY_BUDGET=50,
+        POLL_QUOTA_SAFETY_STOP_ENABLED=True,
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+        EMAIL_DELIVERY_MODE="fake",
+    )
+
+    user = User(email="owner@example.com")
+    channel = Channel(youtube_channel_id="channel-a", title="A", uploads_playlist_id="uploads-a")
+    db_session.add_all([user, channel])
+    db_session.flush()
+
+    video = Video(
+        youtube_video_id="video-a",
+        channel_id=channel.id,
+        title="Video A",
+        published_at=datetime.now(UTC),
+    )
+    db_session.add(video)
+    db_session.flush()
+
+    delivery = NotificationDelivery(
+        user_id=user.id,
+        video_id=video.id,
+        status="pending_retry",
+        attempt_count=1,
+        last_error="timeout",
+    )
+    db_session.add(delivery)
+    db_session.add(
+        OAuthAccount(
+            user_id=user.id,
+            provider="google",
+            access_token="token",
+            refresh_token="refresh",
+            token_expiry=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        polling_module.GoogleOAuthService,
+        "ensure_valid_credentials",
+        lambda self, session, oauth_account: object(),  # noqa: ARG005
+    )
+
+    class FakeYouTube:
+        def playlistItems(self):  # pragma: no cover
+            raise AssertionError("No monitored channels should be polled in this test")
+
+    monkeypatch.setattr(polling_module, "build", lambda *args, **kwargs: FakeYouTube())
+
+    def fake_send_failure(self, payload):  # noqa: ANN001, ARG001
+        raise EmailDeliveryAttemptError("retry failed", retryable=True)
+
+    monkeypatch.setattr(polling_module.EmailDeliveryService, "send_video_notification", fake_send_failure)
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.post(
+            "/internal/run-poll",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+
+    refreshed = db_session.query(NotificationDelivery).one()
+    assert refreshed.status == "failed"
+    assert refreshed.attempt_count == 2
+    assert refreshed.last_attempt_at is not None
+    assert refreshed.last_error == "retry failed"
+
+
+def test_run_poll_blocks_fake_email_mode_in_production(db_session) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        APP_ENV="production",
+        EMAIL_DELIVERY_MODE="fake",
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+    )
+
+    user = User(email="owner@example.com")
+    db_session.add(user)
+    db_session.flush()
+    db_session.add(
+        OAuthAccount(
+            user_id=user.id,
+            provider="google",
+            access_token="token",
+            refresh_token="refresh",
+            token_expiry=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    db_session.commit()
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.post(
+            "/internal/run-poll",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Polling run failed. Inspect service logs or stored sync state for details."

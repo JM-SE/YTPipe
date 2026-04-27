@@ -18,11 +18,15 @@ from app.models.user import User
 from app.models.user_channel import UserChannel
 from app.models.video import Video
 from app.services.auth import GoogleOAuthService
+from app.services.email import EmailDeliveryAttemptError, EmailDeliveryService, EmailNotificationPayload
 
 POLLING_PROCESS = "polling"
 QUOTA_PROCESS = "quota"
 UNUSABLE_UPLOADS_PLAYLIST_ERROR = "unusable_uploads_playlist"
 DEFAULT_DELIVERY_STATUS = "pending"
+DELIVERY_PENDING_RETRY_STATUS = "pending_retry"
+DELIVERY_DELIVERED_STATUS = "delivered"
+DELIVERY_FAILED_STATUS = "failed"
 
 
 @dataclass
@@ -50,8 +54,15 @@ class PollingChannelError(Exception):
 
 
 class YouTubePollingService:
-    def __init__(self, auth_service: GoogleOAuthService, daily_quota_budget: int, safety_stop_enabled: bool):
+    def __init__(
+        self,
+        auth_service: GoogleOAuthService,
+        email_service: EmailDeliveryService,
+        daily_quota_budget: int,
+        safety_stop_enabled: bool,
+    ):
         self.auth_service = auth_service
+        self.email_service = email_service
         self.daily_quota_budget = max(0, daily_quota_budget)
         self.safety_stop_enabled = safety_stop_enabled
 
@@ -91,6 +102,8 @@ class YouTubePollingService:
         new_videos_detected = 0
         channel_errors: list[dict[str, Any]] = []
 
+        self._process_pending_retry_deliveries(session, user)
+
         for user_channel, channel in monitored_rows:
             try:
                 if channel.uploads_playlist_id:
@@ -111,7 +124,13 @@ class YouTubePollingService:
                     continue
 
                 video = self._get_or_create_video(session, channel.id, latest_upload)
-                self._get_or_create_delivery(session, user.id, video.id)
+                delivery = self._get_or_create_delivery(session, user.id, video.id)
+                self._attempt_initial_delivery_send(
+                    delivery=delivery,
+                    user=user,
+                    channel=channel,
+                    video=video,
+                )
                 user_channel.last_seen_video_id = latest_upload.video_id
                 new_videos_detected += 1
                 channels_processed += 1
@@ -233,6 +252,82 @@ class YouTubePollingService:
             session.add(delivery)
             session.flush()
         return delivery
+
+    def _process_pending_retry_deliveries(self, session: Session, user: User) -> None:
+        retry_rows = session.execute(
+            select(NotificationDelivery, Video, Channel)
+            .join(Video, NotificationDelivery.video_id == Video.id)
+            .join(Channel, Video.channel_id == Channel.id)
+            .where(
+                NotificationDelivery.user_id == user.id,
+                NotificationDelivery.status == DELIVERY_PENDING_RETRY_STATUS,
+                NotificationDelivery.attempt_count == 1,
+            )
+            .order_by(NotificationDelivery.id.asc())
+        ).all()
+
+        for delivery, video, channel in retry_rows:
+            self._attempt_delivery_send(
+                delivery=delivery,
+                user=user,
+                channel=channel,
+                video=video,
+                is_retry=True,
+            )
+
+    def _attempt_initial_delivery_send(
+        self,
+        delivery: NotificationDelivery,
+        user: User,
+        channel: Channel,
+        video: Video,
+    ) -> None:
+        if delivery.status != DEFAULT_DELIVERY_STATUS:
+            return
+
+        self._attempt_delivery_send(
+            delivery=delivery,
+            user=user,
+            channel=channel,
+            video=video,
+            is_retry=False,
+        )
+
+    def _attempt_delivery_send(
+        self,
+        delivery: NotificationDelivery,
+        user: User,
+        channel: Channel,
+        video: Video,
+        *,
+        is_retry: bool,
+    ) -> None:
+        youtube_video_id = video.youtube_video_id
+        attempted_at = datetime.now(UTC)
+
+        payload = EmailNotificationPayload(
+            recipient_email=user.email,
+            channel_title=channel.title,
+            video_title=video.title,
+            youtube_video_id=youtube_video_id,
+        )
+
+        try:
+            self.email_service.send_video_notification(payload)
+        except EmailDeliveryAttemptError as exc:
+            delivery.attempt_count += 1
+            delivery.last_attempt_at = attempted_at
+            delivery.last_error = exc.message
+            if is_retry:
+                delivery.status = DELIVERY_FAILED_STATUS
+            else:
+                delivery.status = DELIVERY_PENDING_RETRY_STATUS if exc.retryable else DELIVERY_FAILED_STATUS
+            return
+
+        delivery.attempt_count += 1
+        delivery.last_attempt_at = attempted_at
+        delivery.last_error = None
+        delivery.status = DELIVERY_DELIVERED_STATUS
 
     def _build_quota_context(self, quota_state: SyncState, now: datetime) -> dict[str, Any]:
         existing = quota_state.state_metadata or {}

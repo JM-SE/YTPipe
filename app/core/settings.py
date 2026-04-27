@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     internal_api_bearer_token: str = Field(default="replace-me-internal", alias="INTERNAL_API_BEARER_TOKEN")
     poll_quota_daily_budget: int = Field(default=500, alias="POLL_QUOTA_DAILY_BUDGET")
     poll_quota_safety_stop_enabled: bool = Field(default=True, alias="POLL_QUOTA_SAFETY_STOP_ENABLED")
+    email_delivery_mode: str = Field(default="fake", alias="EMAIL_DELIVERY_MODE")
+    resend_api_key: str = Field(default="", alias="RESEND_API_KEY")
+    resend_from_email: str = Field(default="", alias="RESEND_FROM_EMAIL")
     database_url: str = Field(
         default="postgresql+psycopg://postgres:postgres@localhost:5432/ytpipe",
         alias="DATABASE_URL",
