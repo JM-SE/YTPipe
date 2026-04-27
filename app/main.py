@@ -11,6 +11,7 @@ from app.core.settings import get_settings
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    settings.validate_runtime_config()
 
     app = FastAPI(title=settings.app_name)
     app.include_router(auth_router)

@@ -806,12 +806,18 @@ def test_run_poll_retryable_initial_email_failure_marks_pending_retry(db_session
         app.dependency_overrides.clear()
 
     assert response.status_code == 200
+    assert response.json()["channels_failed"] == 0
+    assert response.json()["new_videos_detected"] == 1
 
     delivery = db_session.query(NotificationDelivery).one()
     assert delivery.status == "pending_retry"
     assert delivery.attempt_count == 1
     assert delivery.last_attempt_at is not None
     assert delivery.last_error == "transient email error"
+
+    polling_state = db_session.query(SyncState).filter_by(process_type=POLLING_PROCESS).one()
+    assert polling_state.state_metadata["channels_failed"] == 0
+    assert polling_state.state_metadata["new_videos_detected"] == 1
 
 
 def test_run_poll_permanent_initial_email_failure_marks_failed(db_session, monkeypatch) -> None:

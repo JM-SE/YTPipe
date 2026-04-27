@@ -1,4 +1,5 @@
 from functools import lru_cache
+from urllib.parse import urlparse
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -52,6 +53,63 @@ class Settings(BaseSettings):
                 "redirect_uris": [self.google_redirect_uri],
             }
         }
+
+    def validate_runtime_config(self) -> None:
+        """Fail clearly for unsafe non-local runtime configuration."""
+        app_env = self.app_env.strip().lower()
+        allowed_envs = {"local", "staging", "production"}
+        if app_env not in allowed_envs:
+            raise RuntimeError(
+                "Unsafe runtime configuration: "
+                f"APP_ENV must be one of {sorted(allowed_envs)}, got `{self.app_env}`."
+            )
+        if app_env == "local":
+            return
+
+        errors: list[str] = []
+        self._require_non_placeholder("APP_SECRET_KEY", self.app_secret_key, "replace-me", errors)
+        self._require_non_placeholder(
+            "INTERNAL_API_BEARER_TOKEN",
+            self.internal_api_bearer_token,
+            "replace-me-internal",
+            errors,
+        )
+        self._require_non_placeholder("DATABASE_URL", self.database_url, "", errors)
+        self._require_non_placeholder("GOOGLE_CLIENT_ID", self.google_client_id, "", errors)
+        self._require_non_placeholder("GOOGLE_CLIENT_SECRET", self.google_client_secret, "", errors)
+        self._require_non_placeholder("GOOGLE_REDIRECT_URI", self.google_redirect_uri, "", errors)
+
+        if self.database_url and not self.database_url.startswith("postgresql+psycopg://"):
+            errors.append("DATABASE_URL must use the SQLAlchemy psycopg scheme `postgresql+psycopg://`.")
+        if "localhost" in self.database_url or "127.0.0.1" in self.database_url:
+            errors.append("DATABASE_URL must not point at localhost outside local development.")
+        if "sslmode=require" not in self.database_url:
+            errors.append("DATABASE_URL must require SSL outside local development, e.g. include `sslmode=require`.")
+
+        redirect = urlparse(self.google_redirect_uri)
+        if redirect.scheme != "https" or not redirect.netloc:
+            errors.append("GOOGLE_REDIRECT_URI must be an absolute HTTPS URL outside local development.")
+
+        email_mode = self.email_delivery_mode.strip().lower()
+        if app_env == "production":
+            if email_mode != "resend":
+                errors.append("EMAIL_DELIVERY_MODE must be `resend` when APP_ENV=production.")
+            self._require_non_placeholder("RESEND_API_KEY", self.resend_api_key, "replace-me", errors)
+            self._require_non_placeholder("RESEND_FROM_EMAIL", self.resend_from_email, "replace-me", errors)
+        elif email_mode not in {"fake", "resend"}:
+            errors.append("EMAIL_DELIVERY_MODE must be either `fake` or `resend`.")
+
+        if errors:
+            formatted = "; ".join(errors)
+            raise RuntimeError(f"Unsafe runtime configuration: {formatted}")
+
+    @staticmethod
+    def _require_non_placeholder(name: str, value: str, placeholder: str, errors: list[str]) -> None:
+        normalized = value.strip()
+        if not normalized:
+            errors.append(f"{name} is required.")
+        elif placeholder and normalized == placeholder:
+            errors.append(f"{name} must not use placeholder value `{placeholder}`.")
 
 
 @lru_cache
