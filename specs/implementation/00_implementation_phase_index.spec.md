@@ -19,6 +19,18 @@
 6. `05_hardening.spec.md` - Enforce deduplication, idempotent and transactional behavior, error recording, `/status` contract, and observability coverage.
 7. `06_deployment_readiness.spec.md` - Finalize environment contract, deployment assumptions, production-safe checks, smoke tests, and free-tier operating guidance.
 
+Post-staging appendix/follow-up: `06c_production_finalization.spec.md` - Finalize real Resend validation and production deployment readiness after staging has passed, without changing the completed MVP phase order.
+
+Execution workflow/policy: `07_execution_workflow.spec.md` remains an execution workflow and repository policy spec, not a product functionality phase.
+
+## Post-MVP Mobile-Readiness Phases
+
+These phases prepare the backend API for a future React Native/Expo companion app without changing the completed MVP phase order.
+
+1. `08_mobile_api_auth_and_swagger.spec.md` - Add separate mobile/admin bearer-token contract and improve Swagger/OpenAPI usability while preserving protected docs behavior.
+2. `09_channel_catalog_api.spec.md` - Make the channel catalog endpoint UI-friendly with filters, pagination, default monitored view, and activation docs.
+3. `10_mobile_activity_api.spec.md` - Add read-only mobile activity/history endpoint for detected videos and delivery status.
+
 ## Dependencies
 - Phase 1 is required before all other phases.
 - Phase 2 depends on the Phase 1 app, DB, and migration baseline.

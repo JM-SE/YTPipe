@@ -21,6 +21,8 @@ services:
         sync: false
       - key: INTERNAL_API_BEARER_TOKEN
         sync: false
+      - key: MOBILE_API_BEARER_TOKEN
+        sync: false
       - key: DATABASE_URL
         sync: false
       - key: GOOGLE_CLIENT_ID

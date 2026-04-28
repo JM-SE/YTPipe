@@ -79,7 +79,7 @@ Single technical user (owner of the system).
 5. Baseline is established when monitoring is enabled and first polled, with no notification for that baseline
 
 ### 5.4 Polling Detection
-1. External cron triggers polling
+1. Upstash QStash schedule triggers polling
 2. System checks only explicitly monitored channels sequentially through the YouTube Data API uploads playlist path
 3. Detects latest video
 
@@ -140,11 +140,11 @@ Single technical user (owner of the system).
 ### Components
 - FastAPI backend
 - PostgreSQL (Neon)
-- External cron trigger
+- Upstash QStash schedule trigger
 - Email provider API (Resend)
 
 ### Flow
-cron → API → DB → detect → email
+QStash schedule → API → DB → detect → email
 
 ---
 
@@ -155,7 +155,7 @@ cron → API → DB → detect → email
 - SQLAlchemy
 - Alembic
 - PostgreSQL
-- External cron (cron-job.org)
+- Upstash QStash schedules
 - Email API (Resend)
 
 ---
@@ -164,7 +164,7 @@ cron → API → DB → detect → email
 
 - Polling over push (simplicity)
 - YouTube Data API uploads playlist detection over search-based detection (quota efficiency)
-- External cron (free-tier limitation)
+- External scheduler via Upstash QStash schedules (free-tier-friendly)
 - Resend for simpler MVP email integration
 - Email API over SMTP
 - Single retry strategy on next cycle for transient email failures only
@@ -236,7 +236,7 @@ cron → API → DB → detect → email
 
 ## 15. Polling Flow (Detailed)
 
-1. Triggered by cron if quota budget remains available
+1. Triggered by QStash schedule if quota budget remains available
 2. Fetch only explicitly monitored channels
 3. For each channel:
     - get latest upload from the channel uploads playlist
@@ -304,7 +304,8 @@ Expose:
 
 - Render (free)
 - Neon DB
-- cron-job.org
+- Upstash QStash schedules
+- Historical note: cron-job.org was tried and superseded for Render Free because its 30 second timeout and Render Free cold-start behavior were unreliable.
 
 ---
 
@@ -326,7 +327,7 @@ Expose:
 
 - API rate limits
 - email failures
-- cron reliability
+- scheduler reliability
 
 ---
 
@@ -338,7 +339,7 @@ Expose:
 4. Channel monitoring management
 5. Polling
 6. Email
-7. Cron
+7. QStash scheduler
 
 ---
 

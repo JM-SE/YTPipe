@@ -1,7 +1,7 @@
 # Database Connection Resilience Specification
 
 ## Context
-After staging deploy and the first cron-job.org run, `POST /internal/run-poll` reached Render but returned 500. Render logs showed `psycopg.errors.AdminShutdown: terminating connection due to administrator command`, wrapped as SQLAlchemy `OperationalError`, on the first database query (`SELECT users...` via `session.scalar(select(User))`). The failure occurred before OAuth, YouTube, or polling logic, indicating a stale or closed Neon/Postgres connection in Render/free-tier idle behavior rather than cron auth or OAuth failure.
+After staging deploy and the first historical cron-job.org run, `POST /internal/run-poll` reached Render but returned 500. Render logs showed `psycopg.errors.AdminShutdown: terminating connection due to administrator command`, wrapped as SQLAlchemy `OperationalError`, on the first database query (`SELECT users...` via `session.scalar(select(User))`). The failure occurred before OAuth, YouTube, or polling logic, indicating a stale or closed Neon/Postgres connection in Render/free-tier idle behavior rather than scheduler auth or OAuth failure. cron-job.org has since been superseded by Upstash QStash for staging because cron-job.org's 30 second timeout and Render Free cold-start behavior were unreliable.
 
 ## Requirements
 - [ ] Harden the SQLAlchemy engine for Render + Neon serverless/free-tier idle connection behavior.
@@ -20,10 +20,10 @@ Update only the SQLAlchemy engine configuration so pooled connections are checke
 2. Add `pool_pre_ping=True` to the engine configuration.
 3. Add or evaluate `pool_recycle=300` for non-local deployed environments if compatible with the existing settings model.
 4. Preserve all existing endpoint behavior and authentication requirements.
-5. Verify the deployed staging runtime with a manual cron retry.
+5. Verify the deployed staging runtime with a manual QStash publish or scheduled delivery retry.
 
 ## Acceptance Criteria
-- [ ] Manual cron retry of `POST /internal/run-poll` no longer fails due to a stale or closed database connection.
+- [ ] Manual QStash publish or scheduled delivery of `POST /internal/run-poll` no longer fails due to a stale or closed database connection.
 - [ ] `/health` remains public.
 - [ ] `/status` still works with required bearer protection.
 - [ ] `/internal/run-poll` still works with required bearer protection.

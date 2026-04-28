@@ -3,10 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import require_internal_bearer_token
+from app.api.dependencies import require_admin_bearer_token
 from app.core.settings import Settings, get_settings
 from app.db.session import get_db_session
 from app.models.oauth_account import OAuthAccount
@@ -16,14 +17,34 @@ from app.services.auth import GOOGLE_PROVIDER, GoogleOAuthService
 from app.services.email import EmailDeliveryService
 from app.services.polling import POLLING_PROCESS, YouTubePollingService
 
-router = APIRouter(prefix="/internal", tags=["internal"])
+router = APIRouter(prefix="/internal", tags=["polling"])
 
 
-@router.post("/run-poll", dependencies=[Depends(require_internal_bearer_token)])
+class PollRunResponse(BaseModel):
+    run_outcome: str
+    channels_processed: int
+    channels_failed: int
+    baselines_established: int
+    new_videos_detected: int
+    quota_blocked: bool
+
+
+class ErrorResponse(BaseModel):
+    detail: str
+
+
+@router.post(
+    "/run-poll",
+    dependencies=[Depends(require_admin_bearer_token)],
+    response_model=PollRunResponse,
+    responses={409: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
+    summary="Run monitored-channel poll",
+    description="Runs one polling cycle for explicitly monitored channels and returns aggregate run metrics.",
+)
 def run_poll(
     settings: Settings = Depends(get_settings),
     session: Session = Depends(get_db_session),
-) -> dict[str, object]:
+) -> PollRunResponse:
     user = session.scalar(select(User))
     if user is None:
         raise HTTPException(
@@ -80,11 +101,11 @@ def run_poll(
             detail = f"Polling run failed: {exc}"
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
 
-    return {
-        "run_outcome": summary.run_outcome,
-        "channels_processed": summary.channels_processed,
-        "channels_failed": summary.channels_failed,
-        "baselines_established": summary.baselines_established,
-        "new_videos_detected": summary.new_videos_detected,
-        "quota_blocked": summary.quota_blocked,
-    }
+    return PollRunResponse(
+        run_outcome=summary.run_outcome,
+        channels_processed=summary.channels_processed,
+        channels_failed=summary.channels_failed,
+        baselines_established=summary.baselines_established,
+        new_videos_detected=summary.new_videos_detected,
+        quota_blocked=summary.quota_blocked,
+    )

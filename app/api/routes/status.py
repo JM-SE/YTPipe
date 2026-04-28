@@ -3,10 +3,11 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import require_internal_bearer_token
+from app.api.dependencies import require_admin_bearer_token
 from app.core.settings import Settings, get_settings
 from app.db.session import get_db_session
 from app.models.notification_delivery import NotificationDelivery
@@ -19,7 +20,17 @@ from app.services.subscriptions import SUBSCRIPTION_SYNC_PROCESS
 router = APIRouter(tags=["status"])
 
 
-@router.get("/status", dependencies=[Depends(require_internal_bearer_token)])
+class ErrorResponse(BaseModel):
+    detail: str
+
+
+@router.get(
+    "/status",
+    dependencies=[Depends(require_admin_bearer_token)],
+    responses={401: {"model": ErrorResponse}},
+    summary="Get service operational status",
+    description="Returns operational sync, polling, delivery, quota, and channel summary state.",
+)
 def status(
     settings: Settings = Depends(get_settings),
     session: Session = Depends(get_db_session),

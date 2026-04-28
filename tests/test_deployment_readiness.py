@@ -13,6 +13,7 @@ def test_staging_runtime_config_accepts_fake_email_with_safe_secrets() -> None:
         APP_ENV="staging",
         APP_SECRET_KEY="staging-secret",
         INTERNAL_API_BEARER_TOKEN="staging-internal-token",
+        MOBILE_API_BEARER_TOKEN="staging-mobile-token",
         DATABASE_URL="postgresql+psycopg://user:password@example.neon.tech/ytpipe?sslmode=require",
         GOOGLE_CLIENT_ID="google-client-id",
         GOOGLE_CLIENT_SECRET="google-client-secret",
@@ -28,6 +29,7 @@ def test_database_engine_uses_pre_ping_and_recycles_non_local_connections() -> N
         APP_ENV="staging",
         APP_SECRET_KEY="staging-secret",
         INTERNAL_API_BEARER_TOKEN="staging-internal-token",
+        MOBILE_API_BEARER_TOKEN="staging-mobile-token",
         DATABASE_URL="postgresql+psycopg://user:password@example.neon.tech/ytpipe?sslmode=require",
         GOOGLE_CLIENT_ID="google-client-id",
         GOOGLE_CLIENT_SECRET="google-client-secret",
@@ -56,6 +58,7 @@ def test_non_local_runtime_config_rejects_placeholder_secrets() -> None:
         APP_ENV="staging",
         APP_SECRET_KEY="replace-me",
         INTERNAL_API_BEARER_TOKEN="replace-me-internal",
+        MOBILE_API_BEARER_TOKEN="replace-me-mobile",
         DATABASE_URL="postgresql+psycopg://user:password@example.neon.tech/ytpipe?sslmode=require",
         GOOGLE_CLIENT_ID="google-client-id",
         GOOGLE_CLIENT_SECRET="google-client-secret",
@@ -69,6 +72,7 @@ def test_non_local_runtime_config_rejects_placeholder_secrets() -> None:
     message = str(exc_info.value)
     assert "APP_SECRET_KEY must not use placeholder" in message
     assert "INTERNAL_API_BEARER_TOKEN must not use placeholder" in message
+    assert "MOBILE_API_BEARER_TOKEN must not use placeholder" in message
 
 
 def test_non_local_runtime_config_requires_https_google_redirect_uri() -> None:
@@ -76,6 +80,7 @@ def test_non_local_runtime_config_requires_https_google_redirect_uri() -> None:
         APP_ENV="staging",
         APP_SECRET_KEY="staging-secret",
         INTERNAL_API_BEARER_TOKEN="staging-internal-token",
+        MOBILE_API_BEARER_TOKEN="staging-mobile-token",
         DATABASE_URL="postgresql+psycopg://user:password@example.neon.tech/ytpipe?sslmode=require",
         GOOGLE_CLIENT_ID="google-client-id",
         GOOGLE_CLIENT_SECRET="google-client-secret",
@@ -92,6 +97,7 @@ def test_non_local_runtime_config_rejects_unknown_app_env() -> None:
         APP_ENV="prod",
         APP_SECRET_KEY="production-secret",
         INTERNAL_API_BEARER_TOKEN="production-internal-token",
+        MOBILE_API_BEARER_TOKEN="production-mobile-token",
         DATABASE_URL="postgresql+psycopg://user:password@example.neon.tech/ytpipe?sslmode=require",
         GOOGLE_CLIENT_ID="google-client-id",
         GOOGLE_CLIENT_SECRET="google-client-secret",
@@ -110,6 +116,7 @@ def test_non_local_runtime_config_requires_database_ssl() -> None:
         APP_ENV="staging",
         APP_SECRET_KEY="staging-secret",
         INTERNAL_API_BEARER_TOKEN="staging-internal-token",
+        MOBILE_API_BEARER_TOKEN="staging-mobile-token",
         DATABASE_URL="postgresql+psycopg://user:password@example.neon.tech/ytpipe",
         GOOGLE_CLIENT_ID="google-client-id",
         GOOGLE_CLIENT_SECRET="google-client-secret",
@@ -126,6 +133,7 @@ def test_production_runtime_config_requires_resend_delivery() -> None:
         APP_ENV="production",
         APP_SECRET_KEY="production-secret",
         INTERNAL_API_BEARER_TOKEN="production-internal-token",
+        MOBILE_API_BEARER_TOKEN="production-mobile-token",
         DATABASE_URL="postgresql+psycopg://user:password@example.neon.tech/ytpipe?sslmode=require",
         GOOGLE_CLIENT_ID="google-client-id",
         GOOGLE_CLIENT_SECRET="google-client-secret",
@@ -147,6 +155,7 @@ def test_production_runtime_config_rejects_resend_placeholders() -> None:
         APP_ENV="production",
         APP_SECRET_KEY="production-secret",
         INTERNAL_API_BEARER_TOKEN="production-internal-token",
+        MOBILE_API_BEARER_TOKEN="production-mobile-token",
         DATABASE_URL="postgresql+psycopg://user:password@example.neon.tech/ytpipe?sslmode=require",
         GOOGLE_CLIENT_ID="google-client-id",
         GOOGLE_CLIENT_SECRET="google-client-secret",
@@ -177,6 +186,7 @@ def test_render_blueprint_declares_staging_service_and_secret_env_vars() -> None
     assert "value: staging" in render_yaml
     assert "key: EMAIL_DELIVERY_MODE" in render_yaml
     assert "value: fake" in render_yaml
+    assert "key: MOBILE_API_BEARER_TOKEN" in render_yaml
     assert "sync: false" in render_yaml
 
 

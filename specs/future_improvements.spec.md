@@ -18,7 +18,7 @@ Deferred items:
 - Transactional outbox or equivalent design to avoid duplicate emails when provider send succeeds but the database commit fails.
 - Poll-level lock or concurrency guard for overlapping `/internal/run-poll` calls.
 - Race-safe get-or-create behavior and integrity-error recovery around unique `Video` and `NotificationDelivery` inserts.
-- APScheduler or always-on in-app scheduler as a future alternative to external cron.
+- APScheduler or always-on in-app scheduler as a future alternative to the current external QStash scheduler.
 - Homelab deployment as a future deployment evolution.
 - UI/dashboard for channel management and operational status as future product evolution.
 - Multi-channel notifications beyond email as future product evolution.
@@ -26,6 +26,7 @@ Deferred items:
 - Celery, Redis, or background workers only as future explicitly approved architecture, not MVP infrastructure.
 - Stronger token protection and encryption-at-rest for OAuth credentials.
 - Richer observability and alerting beyond `/status`.
+- QStash signature verification as future request-auth hardening; current MVP deployment relies on the existing internal bearer token forwarded by QStash.
 - Broader database resilience and observability beyond the approved MVP `pool_pre_ping`/connection recycle follow-up in `specs/implementation/06b_database_connection_resilience.spec.md`.
 
 ## Implementation Steps

@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     app_port: int = Field(default=8000, alias="APP_PORT")
     app_secret_key: str = Field(default="replace-me", alias="APP_SECRET_KEY")
     internal_api_bearer_token: str = Field(default="replace-me-internal", alias="INTERNAL_API_BEARER_TOKEN")
+    mobile_api_bearer_token: str = Field(default="replace-me-mobile", alias="MOBILE_API_BEARER_TOKEN")
     poll_quota_daily_budget: int = Field(default=500, alias="POLL_QUOTA_DAILY_BUDGET")
     poll_quota_safety_stop_enabled: bool = Field(default=True, alias="POLL_QUOTA_SAFETY_STOP_ENABLED")
     email_delivery_mode: str = Field(default="fake", alias="EMAIL_DELIVERY_MODE")
@@ -72,6 +73,12 @@ class Settings(BaseSettings):
             "INTERNAL_API_BEARER_TOKEN",
             self.internal_api_bearer_token,
             "replace-me-internal",
+            errors,
+        )
+        self._require_non_placeholder(
+            "MOBILE_API_BEARER_TOKEN",
+            self.mobile_api_bearer_token,
+            "replace-me-mobile",
             errors,
         )
         self._require_non_placeholder("DATABASE_URL", self.database_url, "", errors)

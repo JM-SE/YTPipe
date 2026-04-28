@@ -15,7 +15,7 @@ Before implementation begins, confirm that the MVP scope is fixed to the followi
 - no UI
 - email as the only notification channel
 - polling as the only detection strategy for MVP, using the YouTube Data API uploads playlist path
-- external cron triggering the polling endpoint
+- external scheduler triggering the polling endpoint; current deployment recommendation is Upstash QStash schedules
 - all imported subscriptions stored in a catalog but not monitored by default
 - only explicitly enabled channels monitored in MVP
 - one retry for transient failed email delivery only
@@ -40,7 +40,7 @@ The implementation should assume:
 - migrations: Alembic
 - hosting: Render free tier
 - database hosting: Neon free tier
-- scheduler model for MVP: external cron
+- scheduler model for MVP: Upstash QStash schedules as the external scheduler
 - email provider: Resend
 
 ### Important note

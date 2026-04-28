@@ -434,6 +434,78 @@ def test_internal_subscription_sync_returns_catalog_counts(db_session, monkeypat
     }
 
 
+def test_internal_subscription_sync_accepts_mobile_bearer_token(db_session, monkeypatch) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        MOBILE_API_BEARER_TOKEN="mobile-secret",
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+    )
+
+    user = User(email="owner@example.com")
+    db_session.add(user)
+    db_session.flush()
+    oauth_account = OAuthAccount(
+        user_id=user.id,
+        provider="google",
+        access_token="token",
+        refresh_token="refresh",
+    )
+    db_session.add(oauth_account)
+    db_session.commit()
+
+    def fake_sync_subscriptions(self, session, user, oauth_account):  # noqa: ARG001
+        return subscriptions_module.SubscriptionSyncResult(
+            imported_channels=1,
+            created_channels=1,
+            updated_channels=0,
+            created_user_channels=1,
+            updated_user_channels=0,
+        )
+
+    monkeypatch.setattr(subscriptions_module.YouTubeSubscriptionService, "sync_subscriptions", fake_sync_subscriptions)
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.post(
+            "/internal/subscriptions/sync",
+            headers={"Authorization": "Bearer mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+
+
+def test_internal_channels_list_accepts_mobile_bearer_token(db_session) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        MOBILE_API_BEARER_TOKEN="mobile-secret",
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.get(
+            "/internal/channels",
+            headers={"Authorization": "Bearer mobile-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+
+
 def test_internal_channels_list_requires_bearer_token(db_session) -> None:
     client = TestClient(app)
     settings = Settings(
@@ -508,16 +580,121 @@ def test_internal_channels_list_returns_imported_channels_and_monitoring_state(d
                 "is_monitored": True,
                 "last_seen_video_id": "video-123",
                 "baseline_established_at": "2026-04-23T12:00:00",
-            },
-            {
-                "channel_id": channel_b.id,
-                "youtube_channel_id": "channel-bbb",
-                "title": "Beta Channel",
-                "is_monitored": False,
-                "last_seen_video_id": None,
-                "baseline_established_at": None,
-            },
+            }
+        ],
+        "pagination": {
+            "limit": 50,
+            "offset": 0,
+            "total": 1,
+        },
+    }
+
+
+def test_internal_channels_list_filters_unmonitored_and_query(db_session) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+    )
+
+    user = User(email="owner@example.com")
+    channel_a = Channel(youtube_channel_id="channel-aaa", title="Alpha Channel", uploads_playlist_id="uploads-a")
+    channel_b = Channel(youtube_channel_id="channel-bbb", title="Beta Channel", uploads_playlist_id="uploads-b")
+    db_session.add_all([user, channel_a, channel_b])
+    db_session.flush()
+    db_session.add_all(
+        [
+            UserChannel(user_id=user.id, channel_id=channel_a.id, is_monitored=True),
+            UserChannel(user_id=user.id, channel_id=channel_b.id, is_monitored=False),
         ]
+    )
+    db_session.commit()
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        unmonitored_response = client.get(
+            "/internal/channels?monitoring=unmonitored&query=beta",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+        all_response = client.get(
+            "/internal/channels?monitoring=all&query=channel",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert unmonitored_response.status_code == 200
+    assert unmonitored_response.json()["pagination"] == {"limit": 50, "offset": 0, "total": 1}
+    assert [item["title"] for item in unmonitored_response.json()["channels"]] == ["Beta Channel"]
+
+    assert all_response.status_code == 200
+    assert all_response.json()["pagination"] == {"limit": 50, "offset": 0, "total": 2}
+    assert [item["title"] for item in all_response.json()["channels"]] == ["Alpha Channel", "Beta Channel"]
+
+
+def test_internal_channels_list_pagination_and_latest_video_summary(db_session) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+    )
+
+    user = User(email="owner@example.com")
+    channel_a = Channel(youtube_channel_id="channel-aaa", title="Alpha", uploads_playlist_id="uploads-a")
+    channel_b = Channel(youtube_channel_id="channel-bbb", title="Beta", uploads_playlist_id="uploads-b")
+    db_session.add_all([user, channel_a, channel_b])
+    db_session.flush()
+    db_session.add_all(
+        [
+            UserChannel(
+                user_id=user.id,
+                channel_id=channel_a.id,
+                is_monitored=True,
+                last_seen_video_id="video-aaa",
+                baseline_established_at=datetime(2026, 4, 23, 12, 0, tzinfo=timezone.utc),
+            ),
+            UserChannel(user_id=user.id, channel_id=channel_b.id, is_monitored=True),
+        ]
+    )
+    db_session.flush()
+    db_session.add(
+        Video(
+            youtube_video_id="video-aaa",
+            channel_id=channel_a.id,
+            title="Alpha latest",
+            published_at=datetime(2026, 4, 24, 10, 0, tzinfo=timezone.utc),
+        )
+    )
+    db_session.commit()
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.get(
+            "/internal/channels?monitoring=all&limit=1&offset=0",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["pagination"] == {"limit": 1, "offset": 0, "total": 2}
+    assert len(payload["channels"]) == 1
+    assert payload["channels"][0]["title"] == "Alpha"
+    assert payload["channels"][0]["latest_detected_video"] == {
+        "youtube_video_id": "video-aaa",
+        "title": "Alpha latest",
+        "published_at": "2026-04-24T10:00:00",
     }
 
 
@@ -559,8 +736,6 @@ def test_internal_channel_monitoring_patch_toggles_false_to_true(db_session) -> 
         "youtube_channel_id": "channel-123",
         "title": "Example Channel",
         "is_monitored": True,
-        "last_seen_video_id": None,
-        "baseline_established_at": None,
     }
     assert user_channel.is_monitored is True
     assert user_channel.last_seen_video_id is None

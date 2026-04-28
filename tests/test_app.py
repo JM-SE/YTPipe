@@ -209,3 +209,26 @@ def test_status_endpoint_returns_operational_summary(db_session) -> None:
     assert payload["quota"]["daily_quota_budget"] == 500
     assert payload["quota"]["estimated_units_used_today"] == 7
     assert payload["channels"] == {"imported_count": 2, "monitored_count": 1}
+
+
+def test_status_endpoint_accepts_mobile_bearer_token(db_session) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        MOBILE_API_BEARER_TOKEN="mobile-secret",
+        DATABASE_URL="sqlite://",
+    )
+    user = User(email="owner@example.com")
+    db_session.add(user)
+    db_session.commit()
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.get("/status", headers={"Authorization": "Bearer mobile-secret"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200

@@ -8,7 +8,7 @@ Levantar una versión **staging** de YTPipe en Render.
 - App: **Render Web Service**
 - Email: **fake mode** (`EMAIL_DELIVERY_MODE=fake`), sin emails reales todavía
 - Migraciones: **manuales**
-- Cron: configurar después del smoke test manual
+- Scheduler: **Upstash QStash schedules** configurado después del smoke test manual
 - Resend real: pendiente para producción final
 
 ---
@@ -598,41 +598,64 @@ channels
 
 ---
 
-## 16. Configurar cron-job.org después del smoke test
+## 16. Configurar QStash después del smoke test
 
-Entrar a:
+Scheduler confirmado para staging: **Upstash QStash schedules**. cron-job.org queda descartado/superseded para Render Free porque su timeout de 30 segundos y el wakeup de Render Free fueron poco confiables.
+
+Base URL para API calls de QStash, porque el token pertenece a región US:
 
 ```text
-https://cron-job.org/
+https://qstash-us-east-1.upstash.io
 ```
 
-1. Crear cuenta o login.
-2. Crear nuevo cronjob.
-3. URL:
+### 16.1 Contrato QStash staging
+
+Valores confirmados:
+
+- Schedule ID: `ytpipe-staging-hourly-poll`
+- Cron UTC: `0 * * * *`
+- Destination:
 
 ```text
 https://ytpipe-staging.onrender.com/internal/run-poll
 ```
 
-4. Method:
+- QStash API auth header:
 
 ```text
-POST
+Authorization: Bearer <QSTASH_TOKEN>
 ```
 
-5. Header:
+- App auth forwarded by QStash:
 
 ```text
-Authorization: Bearer <INTERNAL_API_BEARER_TOKEN_REAL>
+Upstash-Forward-Authorization: Bearer <INTERNAL_API_BEARER_TOKEN>
 ```
 
-6. Schedule recomendado inicial:
+No se requiere body; `{}` es aceptable para publish manual o creación de schedule.
 
-```text
-Every 1 hour
-```
+### 16.2 Validación QStash completada en staging
 
-No usar cada 10 minutos todavía.
+Evidencia confirmada:
+
+- Manual publish a `POST /internal/run-poll` devolvió `messageId`.
+- Creación del schedule devolvió `scheduleId: ytpipe-staging-hourly-poll`.
+- Render logs muestran servidor iniciado y respuesta 200 para `POST /internal/run-poll`.
+- QStash logs muestran la delivery.
+- `/status` en staging devolvió estado healthy/ready:
+  - `service=ytpipe`
+  - `environment=staging`
+  - `ready=True`
+  - polling `last_success_at=2026-04-28T20:20:25.554663Z`
+  - email `delivered_count=1`
+  - quota `estimated_units_used_today=1`
+  - channels `monitored_count=1`
+
+### 16.3 Nota histórica: cron-job.org descartado
+
+cron-job.org fue probado, pero queda superseded para este deployment por timeout máximo de 30 segundos y cold starts de Render Free poco confiables. No configurarlo como scheduler actual. No habilitar retries agresivos en QStash hasta que exista lock/guard de concurrencia para polling; retries superpuestos podrían disparar ejecuciones simultáneas.
+
+No agregar verificación de firma QStash en producto por ahora: el contrato actual sigue siendo bearer token interno reenviado por QStash. La verificación de firma QStash queda como hardening futuro si se aprueba.
 
 ---
 
@@ -674,6 +697,13 @@ RESEND_FROM_EMAIL=<sender-verificado>
 - [x] Canales se listan.
 - [x] Se puede activar monitoreo.
 - [x] Primer poll establece baseline.
-- [x] cron-job.org configurado solo después de validar manualmente.
+- [x] QStash manual publish a `POST /internal/run-poll` devolvió `messageId`.
+- [x] QStash schedule creado: `scheduleId=ytpipe-staging-hourly-poll`, cron `0 * * * *` UTC.
+- [x] QStash usa base URL `https://qstash-us-east-1.upstash.io`.
+- [x] QStash reenvía app auth con `Upstash-Forward-Authorization: Bearer <INTERNAL_API_BEARER_TOKEN>`.
+- [x] Render logs muestran 200 para `POST /internal/run-poll` desde QStash.
+- [x] QStash logs muestran delivery exitosa.
+- [x] `/status` staging healthy/ready después del run: `service=ytpipe`, `environment=staging`, `ready=True`, `delivered_count=1`, `estimated_units_used_today=1`, `monitored_count=1`.
+- [x] cron-job.org deshabilitado/superseded para Render Free por timeout/cold-start unreliable.
 
-Nota: la primera ejecución de cron-job.org llegó a la API, pero devolvió 500 por un problema de conexión a base de datos `AdminShutdown`/conexión stale. Esto se trackea por separado y no significa que la configuración de cron haya fallado.
+Nota: la primera ejecución histórica de cron-job.org llegó a la API, pero devolvió 500 por un problema de conexión a base de datos `AdminShutdown`/conexión stale. Luego cron-job.org fue reemplazado por QStash por confiabilidad en Render Free.

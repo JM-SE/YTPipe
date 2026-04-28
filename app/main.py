@@ -5,7 +5,7 @@ from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from starlette.responses import HTMLResponse, JSONResponse
 
-from app.api.dependencies import validate_internal_bearer_token
+from app.api.dependencies import validate_admin_bearer_token
 from app.api.routes.auth import router as auth_router
 from app.api.routes.channels import router as channels_router
 from app.api.routes.health import router as health_router
@@ -39,7 +39,7 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
     def require_docs_access(authorization: str | None = Header(default=None)) -> None:
         if settings.app_env.strip().lower() == "local":
             return
-        validate_internal_bearer_token(authorization, settings)
+        validate_admin_bearer_token(authorization, settings)
 
     def custom_openapi() -> dict[str, Any]:
         if app.openapi_schema:
