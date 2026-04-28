@@ -70,6 +70,11 @@ def test_openapi_declares_bearer_auth_for_protected_endpoints() -> None:
     request_schema = channels_patch["requestBody"]["content"]["application/json"]["schema"]
     assert "$ref" in request_schema
 
+    activity_get = schema["paths"]["/internal/activity"]["get"]
+    activity_params = {parameter["name"] for parameter in activity_get["parameters"]}
+    assert {"status", "limit", "offset"}.issubset(activity_params)
+    assert activity_get["summary"] == "List mobile activity"
+
 
 def test_health_remains_public_and_internal_endpoints_still_require_bearer() -> None:
     client = TestClient(create_app(_staging_settings()))
