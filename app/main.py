@@ -10,6 +10,7 @@ from app.api.routes.activity import router as activity_router
 from app.api.routes.auth import router as auth_router
 from app.api.routes.channels import router as channels_router
 from app.api.routes.health import router as health_router
+from app.api.routes.mobile_push import router as mobile_push_router
 from app.api.routes.polling import router as polling_router
 from app.api.routes.status import router as status_router
 from app.api.routes.subscriptions import router as subscriptions_router
@@ -34,6 +35,7 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
     app.include_router(activity_router)
     app.include_router(channels_router)
     app.include_router(health_router)
+    app.include_router(mobile_push_router)
     app.include_router(polling_router)
     app.include_router(status_router)
     app.include_router(subscriptions_router)

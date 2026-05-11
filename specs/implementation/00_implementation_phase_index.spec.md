@@ -31,6 +31,14 @@ These phases prepare the backend API for a future React Native/Expo companion ap
 2. `09_channel_catalog_api.spec.md` - Make the channel catalog endpoint UI-friendly with filters, pagination, default monitored view, and activation docs.
 3. `10_mobile_activity_api.spec.md` - Add read-only mobile activity/history endpoint for detected videos and delivery status.
 
+## Post-MVP Mobile Push Backend Phases
+
+These phases add Expo-backed mobile push support after mobile-readiness APIs, without changing completed MVP phase history.
+
+1. `11A_mobile_push_schema_settings_service.spec.md` - Add push settings, schema, models, and service skeleton without endpoints, polling integration, or real sends.
+2. `11B_mobile_push_endpoints_status_preferences_test.spec.md` - Add mobile-push endpoints for status, registration, settings, channel preferences, unregister, and synchronous test sends.
+3. `11C_mobile_push_poll_trigger_send_idempotency.spec.md` - Future phase for polling new-video trigger integration, fan-out, and idempotent push delivery behavior.
+
 ## Dependencies
 - Phase 1 is required before all other phases.
 - Phase 2 depends on the Phase 1 app, DB, and migration baseline.

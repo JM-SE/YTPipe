@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -48,14 +49,15 @@ class PushSendResult:
     sent: bool
     disabled: bool
     message: str
+    invalid_token: bool = False
+    expo_status: str | None = None
+    expo_ticket_id: str | None = None
+    last_attempt_at: datetime | None = None
+    http_status_code: int | None = None
 
 
 class MobilePushService:
-    """Network-free mobile push foundation for Phase 11A.
-
-    Later phases can reuse these helpers from API endpoints and polling integration.
-    This class intentionally does not perform Expo HTTP requests in Phase 11A.
-    """
+    """Mobile push domain helpers shared by API endpoints and polling integration."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -70,6 +72,27 @@ class MobilePushService:
             )
             session.add(push_settings)
             session.flush()
+        return push_settings
+
+    def update_global_settings(
+        self,
+        session: Session,
+        *,
+        user_id: int,
+        enabled: bool | None = None,
+        default_for_monitored_channels: bool | None = None,
+    ) -> MobilePushSetting:
+        push_settings = self.get_or_create_global_settings(session, user_id)
+        was_enabled = push_settings.enabled
+
+        if default_for_monitored_channels is not None:
+            push_settings.default_for_monitored_channels = default_for_monitored_channels
+        if enabled is not None:
+            push_settings.enabled = enabled
+            if enabled and not was_enabled and push_settings.first_enabled_at is None:
+                push_settings.first_enabled_at = datetime.now(UTC)
+
+        session.flush()
         return push_settings
 
     def compute_channel_push_state(
@@ -156,6 +179,20 @@ class MobilePushService:
         session.flush()
         return installation
 
+    def get_installation(
+        self,
+        session: Session,
+        *,
+        user_id: int,
+        installation_id: UUID,
+    ) -> MobilePushInstallation | None:
+        return session.scalar(
+            select(MobilePushInstallation).where(
+                MobilePushInstallation.user_id == user_id,
+                MobilePushInstallation.installation_id == installation_id,
+            )
+        )
+
     def get_or_create_new_video_delivery(
         self,
         session: Session,
@@ -239,6 +276,105 @@ class MobilePushService:
             },
         }
 
+    def send_test_push(
+        self,
+        session: Session,
+        *,
+        installation: MobilePushInstallation,
+    ) -> PushSendResult:
+        if not self.settings.push_notifications_enabled:
+            return self.send_disabled_result()
+
+        if (
+            not installation.enabled
+            or installation.unregistered_at is not None
+            or installation.invalidated_at is not None
+            or not installation.expo_push_token
+        ):
+            return PushSendResult(
+                status=PUSH_DELIVERY_SKIPPED,
+                sent=False,
+                disabled=False,
+                message="Installation is not registered for push notifications.",
+                http_status_code=409,
+            )
+
+        now = datetime.now(UTC)
+        delivery = MobilePushDelivery(
+            user_id=installation.user_id,
+            installation_id=installation.id,
+            event_type=PUSH_EVENT_TEST,
+            status=PUSH_DELIVERY_PENDING,
+            attempt_count=1,
+            last_attempt_at=now,
+        )
+        session.add(delivery)
+        installation.last_attempt_at = now
+        session.flush()
+
+        payload = self.build_test_payload(installation=installation)
+        try:
+            response = httpx.post(
+                self.settings.expo_push_endpoint,
+                json=payload,
+                headers=self._expo_headers(),
+                timeout=10.0,
+            )
+            if response.status_code >= 400:
+                return self._mark_test_failure(
+                    delivery=delivery,
+                    installation=installation,
+                    message="Push provider request failed.",
+                    error=f"Expo provider returned HTTP {response.status_code}.",
+                    expo_status="provider_error",
+                )
+            response_payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            return self._mark_test_failure(
+                delivery=delivery,
+                installation=installation,
+                message="Push provider request failed.",
+                error=str(exc),
+                expo_status="provider_error",
+            )
+
+        parsed = _parse_expo_response(response_payload)
+        if parsed["ok"]:
+            ticket_id = parsed.get("ticket_id")
+            delivery.status = PUSH_DELIVERY_SENT
+            delivery.last_success_at = now
+            delivery.expo_status = "ok"
+            delivery.expo_ticket_id = ticket_id
+            delivery.expo_response = _safe_expo_response(parsed)
+            installation.last_success_at = now
+            installation.last_error = None
+            installation.last_expo_status = "ok"
+            installation.last_expo_ticket_id = ticket_id
+            session.flush()
+            return PushSendResult(
+                status=PUSH_DELIVERY_SENT,
+                sent=True,
+                disabled=False,
+                message="Test push notification sent.",
+                expo_status="ok",
+                expo_ticket_id=ticket_id,
+                last_attempt_at=now,
+            )
+
+        invalid_token = parsed.get("error") == "DeviceNotRegistered"
+        failure_status = PUSH_DELIVERY_INVALID_TOKEN if invalid_token else PUSH_DELIVERY_FAILED
+        message = "Expo push token is no longer registered." if invalid_token else "Push provider rejected the request."
+        return self._mark_test_failure(
+            delivery=delivery,
+            installation=installation,
+            message=message,
+            error=parsed.get("message") or message,
+            expo_status=parsed.get("expo_status") or "error",
+            expo_ticket_id=parsed.get("ticket_id"),
+            invalid_token=invalid_token,
+            delivery_status=failure_status,
+        )
+
     def send_disabled_result(self) -> PushSendResult:
         if self.settings.push_notifications_enabled:
             return PushSendResult(
@@ -253,6 +389,67 @@ class MobilePushService:
             sent=False,
             disabled=True,
             message="Push notifications are disabled by configuration.",
+            http_status_code=409,
+        )
+
+    def _expo_headers(self) -> dict[str, str] | None:
+        access_token = self.settings.expo_access_token.strip()
+        if not access_token:
+            return None
+        return {"Authorization": f"Bearer {access_token}"}
+
+    def _sanitize_provider_error(self, message: str | None) -> str:
+        return _sanitize_provider_error(
+            message,
+            sensitive_values=(
+                self.settings.expo_access_token,
+                self.settings.expo_push_endpoint,
+                self.settings.internal_api_bearer_token,
+                self.settings.mobile_api_bearer_token,
+            ),
+        )
+
+    def _mark_test_failure(
+        self,
+        *,
+        delivery: MobilePushDelivery,
+        installation: MobilePushInstallation,
+        message: str,
+        error: str,
+        expo_status: str,
+        expo_ticket_id: str | None = None,
+        invalid_token: bool = False,
+        delivery_status: str = PUSH_DELIVERY_FAILED,
+    ) -> PushSendResult:
+        now = delivery.last_attempt_at or datetime.now(UTC)
+        sanitized_error = self._sanitize_provider_error(error)
+        delivery.status = delivery_status
+        delivery.last_error = sanitized_error
+        delivery.expo_status = expo_status
+        delivery.expo_ticket_id = expo_ticket_id
+        delivery.expo_response = {
+            "status": expo_status,
+            "message": sanitized_error,
+            "error": "DeviceNotRegistered" if invalid_token else None,
+        }
+        installation.last_error = sanitized_error
+        installation.last_expo_status = expo_status
+        installation.last_expo_ticket_id = expo_ticket_id
+        if invalid_token:
+            installation.enabled = False
+            installation.invalidated_at = datetime.now(UTC)
+        delivery.last_attempt_at = now
+        installation.last_attempt_at = now
+        return PushSendResult(
+            status=delivery_status,
+            sent=False,
+            disabled=False,
+            message=message,
+            invalid_token=invalid_token,
+            expo_status=expo_status,
+            expo_ticket_id=expo_ticket_id,
+            last_attempt_at=now,
+            http_status_code=502,
         )
 
 
@@ -275,3 +472,56 @@ def normalize_platform(platform: str | None) -> str:
     if normalized in {PUSH_PLATFORM_IOS, PUSH_PLATFORM_ANDROID}:
         return normalized
     return PUSH_PLATFORM_UNKNOWN
+
+
+def _parse_expo_response(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"ok": False, "expo_status": "malformed", "message": "Malformed Expo response."}
+
+    data = payload.get("data")
+    if isinstance(data, list):
+        entry = data[0] if data else None
+    else:
+        entry = data
+
+    if not isinstance(entry, dict):
+        return {"ok": False, "expo_status": "malformed", "message": "Malformed Expo response."}
+
+    expo_status = str(entry.get("status") or "")
+    ticket_id = entry.get("id") if isinstance(entry.get("id"), str) else None
+    details = entry.get("details") if isinstance(entry.get("details"), dict) else {}
+    error = details.get("error") if isinstance(details.get("error"), str) else None
+    message = entry.get("message") if isinstance(entry.get("message"), str) else "Expo push request failed."
+
+    if expo_status == "ok":
+        return {"ok": True, "expo_status": expo_status, "ticket_id": ticket_id}
+
+    return {
+        "ok": False,
+        "expo_status": expo_status or "error",
+        "ticket_id": ticket_id,
+        "message": _sanitize_provider_error(message),
+        "error": error,
+    }
+
+
+def _safe_expo_response(parsed: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": parsed.get("expo_status"),
+        "ticket_id": parsed.get("ticket_id"),
+    }
+
+
+def _sanitize_provider_error(message: str | None, sensitive_values: tuple[str, ...] = ()) -> str:
+    if not message:
+        return "Push provider request failed."
+    sanitized = message.replace("\n", " ").replace("\r", " ")
+    unsafe_markers = ("Bearer ", "ExponentPushToken[", "Traceback", "stack trace", "http://", "https://")
+    for marker in unsafe_markers:
+        if marker in sanitized:
+            return "Push provider request failed."
+    for value in sensitive_values:
+        stripped = value.strip() if value else ""
+        if stripped and stripped in sanitized:
+            return "Push provider request failed."
+    return sanitized[:300]
