@@ -19,6 +19,7 @@ from app.models.user_channel import UserChannel
 from app.models.video import Video
 from app.services.auth import GoogleOAuthService
 from app.services.email import EmailDeliveryAttemptError, EmailDeliveryService, EmailNotificationPayload
+from app.services.mobile_push import MobilePushService
 
 POLLING_PROCESS = "polling"
 QUOTA_PROCESS = "quota"
@@ -60,11 +61,13 @@ class YouTubePollingService:
         email_service: EmailDeliveryService,
         daily_quota_budget: int,
         safety_stop_enabled: bool,
+        mobile_push_service: MobilePushService | None = None,
     ):
         self.auth_service = auth_service
         self.email_service = email_service
         self.daily_quota_budget = max(0, daily_quota_budget)
         self.safety_stop_enabled = safety_stop_enabled
+        self.mobile_push_service = mobile_push_service
 
     def run_poll(self, session: Session, user: User, oauth_account: OAuthAccount) -> PollRunSummary:
         now = datetime.now(UTC)
@@ -131,6 +134,14 @@ class YouTubePollingService:
                     user=user,
                     channel=channel,
                     video=video,
+                )
+                self._attempt_new_video_push(
+                    session=session,
+                    user=user,
+                    user_channel=user_channel,
+                    channel=channel,
+                    video=video,
+                    delivery=delivery,
                 )
                 user_channel.last_seen_video_id = latest_upload.video_id
                 new_videos_detected += 1
@@ -315,6 +326,31 @@ class YouTubePollingService:
             video=video,
             is_retry=False,
         )
+
+    def _attempt_new_video_push(
+        self,
+        *,
+        session: Session,
+        user: User,
+        user_channel: UserChannel,
+        channel: Channel,
+        video: Video,
+        delivery: NotificationDelivery,
+    ) -> None:
+        if self.mobile_push_service is None:
+            return
+
+        try:
+            self.mobile_push_service.attempt_new_video_push(
+                session,
+                user=user,
+                user_channel=user_channel,
+                channel=channel,
+                video=video,
+                notification_delivery=delivery,
+            )
+        except Exception:  # noqa: BLE001
+            return
 
     def _attempt_delivery_send(
         self,

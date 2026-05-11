@@ -299,20 +299,117 @@ class MobilePushService:
                 http_status_code=409,
             )
 
-        now = datetime.now(UTC)
         delivery = MobilePushDelivery(
             user_id=installation.user_id,
             installation_id=installation.id,
             event_type=PUSH_EVENT_TEST,
             status=PUSH_DELIVERY_PENDING,
-            attempt_count=1,
-            last_attempt_at=now,
         )
         session.add(delivery)
-        installation.last_attempt_at = now
         session.flush()
 
         payload = self.build_test_payload(installation=installation)
+        return self._send_delivery(
+            delivery=delivery,
+            installation=installation,
+            payload=payload,
+            success_message="Test push notification sent.",
+        )
+
+    def attempt_new_video_push(
+        self,
+        session: Session,
+        *,
+        user: User,
+        user_channel: UserChannel,
+        channel: Channel,
+        video: Video,
+        notification_delivery: NotificationDelivery,
+    ) -> list[PushSendResult]:
+        """Best-effort new-video push fan-out for the polling new-video branch."""
+        if not self.settings.push_notifications_enabled:
+            return []
+
+        try:
+            push_settings = self.get_or_create_global_settings(session, user.id)
+            if not push_settings.enabled or not user_channel.is_monitored:
+                return []
+
+            preference = session.scalar(
+                select(MobilePushChannelPreference).where(
+                    MobilePushChannelPreference.user_id == user.id,
+                    MobilePushChannelPreference.channel_id == channel.id,
+                )
+            )
+            channel_state = self.compute_channel_push_state(push_settings, user_channel, preference)
+            if not channel_state.push_enabled:
+                return []
+
+            installations = session.scalars(
+                select(MobilePushInstallation)
+                .where(
+                    MobilePushInstallation.user_id == user.id,
+                    MobilePushInstallation.enabled.is_(True),
+                    MobilePushInstallation.unregistered_at.is_(None),
+                    MobilePushInstallation.invalidated_at.is_(None),
+                )
+                .order_by(MobilePushInstallation.id.asc())
+            ).all()
+
+            results: list[PushSendResult] = []
+            for installation in installations:
+                if not installation.expo_push_token:
+                    continue
+                try:
+                    delivery = self.get_or_create_new_video_delivery(
+                        session,
+                        notification_delivery=notification_delivery,
+                        installation=installation,
+                        video=video,
+                        channel=channel,
+                    )
+                    if delivery.status != PUSH_DELIVERY_PENDING or delivery.attempt_count != 0:
+                        continue
+
+                    payload = self.build_new_video_payload(
+                        installation=installation,
+                        user=user,
+                        channel=channel,
+                        video=video,
+                        notification_delivery=notification_delivery,
+                    )
+                    results.append(
+                        self._send_delivery(
+                            delivery=delivery,
+                            installation=installation,
+                            payload=payload,
+                            success_message="New-video push notification sent.",
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+
+            session.flush()
+            return results
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _send_delivery(
+        self,
+        *,
+        delivery: MobilePushDelivery,
+        installation: MobilePushInstallation,
+        payload: dict[str, Any],
+        success_message: str,
+    ) -> PushSendResult:
+        now = datetime.now(UTC)
+        delivery.attempt_count += 1
+        delivery.last_attempt_at = now
+        installation.last_attempt_at = now
+        session = Session.object_session(delivery)
+        if session is not None:
+            session.flush()
+
         try:
             response = httpx.post(
                 self.settings.expo_push_endpoint,
@@ -321,7 +418,7 @@ class MobilePushService:
                 timeout=10.0,
             )
             if response.status_code >= 400:
-                return self._mark_test_failure(
+                return self._mark_delivery_failure(
                     delivery=delivery,
                     installation=installation,
                     message="Push provider request failed.",
@@ -330,7 +427,15 @@ class MobilePushService:
                 )
             response_payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            return self._mark_test_failure(
+            return self._mark_delivery_failure(
+                delivery=delivery,
+                installation=installation,
+                message="Push provider request failed.",
+                error=str(exc),
+                expo_status="provider_error",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._mark_delivery_failure(
                 delivery=delivery,
                 installation=installation,
                 message="Push provider request failed.",
@@ -350,12 +455,13 @@ class MobilePushService:
             installation.last_error = None
             installation.last_expo_status = "ok"
             installation.last_expo_ticket_id = ticket_id
-            session.flush()
+            if session is not None:
+                session.flush()
             return PushSendResult(
                 status=PUSH_DELIVERY_SENT,
                 sent=True,
                 disabled=False,
-                message="Test push notification sent.",
+                message=success_message,
                 expo_status="ok",
                 expo_ticket_id=ticket_id,
                 last_attempt_at=now,
@@ -364,7 +470,7 @@ class MobilePushService:
         invalid_token = parsed.get("error") == "DeviceNotRegistered"
         failure_status = PUSH_DELIVERY_INVALID_TOKEN if invalid_token else PUSH_DELIVERY_FAILED
         message = "Expo push token is no longer registered." if invalid_token else "Push provider rejected the request."
-        return self._mark_test_failure(
+        return self._mark_delivery_failure(
             delivery=delivery,
             installation=installation,
             message=message,
@@ -409,7 +515,7 @@ class MobilePushService:
             ),
         )
 
-    def _mark_test_failure(
+    def _mark_delivery_failure(
         self,
         *,
         delivery: MobilePushDelivery,
@@ -440,6 +546,9 @@ class MobilePushService:
             installation.invalidated_at = datetime.now(UTC)
         delivery.last_attempt_at = now
         installation.last_attempt_at = now
+        session = Session.object_session(delivery)
+        if session is not None:
+            session.flush()
         return PushSendResult(
             status=delivery_status,
             sent=False,
@@ -516,9 +625,10 @@ def _sanitize_provider_error(message: str | None, sensitive_values: tuple[str, .
     if not message:
         return "Push provider request failed."
     sanitized = message.replace("\n", " ").replace("\r", " ")
-    unsafe_markers = ("Bearer ", "ExponentPushToken[", "Traceback", "stack trace", "http://", "https://")
+    normalized = sanitized.lower()
+    unsafe_markers = ("bearer ", "exponentpushtoken[", "traceback", "stack trace", "http://", "https://")
     for marker in unsafe_markers:
-        if marker in sanitized:
+        if marker in normalized:
             return "Push provider request failed."
     for value in sensitive_values:
         stripped = value.strip() if value else ""
