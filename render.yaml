@@ -17,6 +17,14 @@ services:
         value: 500
       - key: POLL_QUOTA_SAFETY_STOP_ENABLED
         value: true
+      - key: PUSH_NOTIFICATIONS_ENABLED
+        value: false
+      - key: EXPO_PUSH_ENDPOINT
+        value: https://exp.host/--/api/v2/push/send
+      - key: EXPO_PUSH_RECEIPTS_ENABLED
+        value: false
+      - key: EXPO_PUSH_RECEIPTS_ENDPOINT
+        value: https://exp.host/--/api/v2/push/getReceipts
       - key: APP_SECRET_KEY
         sync: false
       - key: INTERNAL_API_BEARER_TOKEN
@@ -34,4 +42,6 @@ services:
       - key: RESEND_API_KEY
         sync: false
       - key: RESEND_FROM_EMAIL
+        sync: false
+      - key: EXPO_ACCESS_TOKEN
         sync: false

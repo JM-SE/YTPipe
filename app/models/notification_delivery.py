@@ -20,3 +20,8 @@ class NotificationDelivery(TimestampMixin, Base):
 
     user = relationship("User", back_populates="notification_deliveries")
     video = relationship("Video", back_populates="notification_deliveries")
+    mobile_push_deliveries = relationship(
+        "MobilePushDelivery",
+        back_populates="notification_delivery",
+        passive_deletes=True,
+    )

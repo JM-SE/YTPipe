@@ -35,6 +35,7 @@ include = ["app*"]
     "alembic/versions/20260422_0001_foundations_baseline.py",
     "alembic/versions/20260423_0002_single_user_guard.py",
     "alembic/versions/20260423_0003_user_channel_import_contract.py",
+    "alembic/versions/20260424_0004_mobile_push_schema_settings_service.py",
 ]
 
 [tool.pytest.ini_options]

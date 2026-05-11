@@ -15,3 +15,16 @@ class User(TimestampMixin, Base):
     user_channels = relationship("UserChannel", back_populates="user")
     notification_deliveries = relationship("NotificationDelivery", back_populates="user")
     sync_states = relationship("SyncState", back_populates="user")
+    mobile_push_setting = relationship(
+        "MobilePushSetting",
+        back_populates="user",
+        passive_deletes=True,
+        uselist=False,
+    )
+    mobile_push_installations = relationship("MobilePushInstallation", back_populates="user", passive_deletes=True)
+    mobile_push_channel_preferences = relationship(
+        "MobilePushChannelPreference",
+        back_populates="user",
+        passive_deletes=True,
+    )
+    mobile_push_deliveries = relationship("MobilePushDelivery", back_populates="user", passive_deletes=True)

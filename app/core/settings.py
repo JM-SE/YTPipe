@@ -28,6 +28,17 @@ class Settings(BaseSettings):
     mobile_api_bearer_token: str = Field(default="replace-me-mobile", alias="MOBILE_API_BEARER_TOKEN")
     poll_quota_daily_budget: int = Field(default=500, alias="POLL_QUOTA_DAILY_BUDGET")
     poll_quota_safety_stop_enabled: bool = Field(default=True, alias="POLL_QUOTA_SAFETY_STOP_ENABLED")
+    push_notifications_enabled: bool = Field(default=False, alias="PUSH_NOTIFICATIONS_ENABLED")
+    expo_push_endpoint: str = Field(
+        default="https://exp.host/--/api/v2/push/send",
+        alias="EXPO_PUSH_ENDPOINT",
+    )
+    expo_push_receipts_enabled: bool = Field(default=False, alias="EXPO_PUSH_RECEIPTS_ENABLED")
+    expo_push_receipts_endpoint: str = Field(
+        default="https://exp.host/--/api/v2/push/getReceipts",
+        alias="EXPO_PUSH_RECEIPTS_ENDPOINT",
+    )
+    expo_access_token: str = Field(default="", alias="EXPO_ACCESS_TOKEN")
     email_delivery_mode: str = Field(default="fake", alias="EMAIL_DELIVERY_MODE")
     resend_api_key: str = Field(default="", alias="RESEND_API_KEY")
     resend_from_email: str = Field(default="", alias="RESEND_FROM_EMAIL")

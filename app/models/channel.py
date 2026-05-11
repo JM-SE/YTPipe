@@ -14,3 +14,9 @@ class Channel(TimestampMixin, Base):
 
     user_channels = relationship("UserChannel", back_populates="channel")
     videos = relationship("Video", back_populates="channel")
+    mobile_push_channel_preferences = relationship(
+        "MobilePushChannelPreference",
+        back_populates="channel",
+        passive_deletes=True,
+    )
+    mobile_push_deliveries = relationship("MobilePushDelivery", back_populates="channel", passive_deletes=True)

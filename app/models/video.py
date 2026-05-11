@@ -17,3 +17,4 @@ class Video(TimestampMixin, Base):
 
     channel = relationship("Channel", back_populates="videos")
     notification_deliveries = relationship("NotificationDelivery", back_populates="video")
+    mobile_push_deliveries = relationship("MobilePushDelivery", back_populates="video", passive_deletes=True)
