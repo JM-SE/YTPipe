@@ -18,6 +18,7 @@ from app.services.email import EmailDeliveryService
 from app.services.mobile_push import MobilePushService
 from app.services.polling import POLLING_PROCESS, YouTubePollingService
 from app.services.telegram import TelegramDeliveryService
+from app.services.transcript import TranscriptService
 
 router = APIRouter(prefix="/internal", tags=["polling"])
 
@@ -76,6 +77,7 @@ def run_poll(
             safety_stop_enabled=settings.poll_quota_safety_stop_enabled,
             mobile_push_service=MobilePushService(settings),
             telegram_service=TelegramDeliveryService(settings),
+            transcript_service=TranscriptService(settings),
         )
         summary = polling_service.run_poll(session, user=user, oauth_account=oauth_account)
         session.commit()

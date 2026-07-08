@@ -21,6 +21,7 @@ from app.services.auth import GoogleOAuthService
 from app.services.email import EmailDeliveryAttemptError, EmailDeliveryService, EmailNotificationPayload
 from app.services.mobile_push import MobilePushService
 from app.services.telegram import TelegramDeliveryAttemptError, TelegramDeliveryService, TelegramNotificationPayload
+from app.services.transcript import TranscriptService
 
 POLLING_PROCESS = "polling"
 QUOTA_PROCESS = "quota"
@@ -64,6 +65,7 @@ class YouTubePollingService:
         safety_stop_enabled: bool,
         mobile_push_service: MobilePushService | None = None,
         telegram_service: TelegramDeliveryService | None = None,
+        transcript_service: TranscriptService | None = None,
     ):
         self.auth_service = auth_service
         self.email_service = email_service
@@ -71,6 +73,7 @@ class YouTubePollingService:
         self.safety_stop_enabled = safety_stop_enabled
         self.mobile_push_service = mobile_push_service
         self.telegram_service = telegram_service
+        self.transcript_service = transcript_service
 
     def run_poll(self, session: Session, user: User, oauth_account: OAuthAccount) -> PollRunSummary:
         now = datetime.now(UTC)
@@ -131,6 +134,7 @@ class YouTubePollingService:
                     continue
 
                 video = self._get_or_create_video(session, channel.id, latest_upload)
+                self._attempt_fetch_and_store_transcript(session, video)
                 delivery = self._get_or_create_delivery(session, user.id, video.id)
                 self._attempt_initial_delivery_send(
                     delivery=delivery,
@@ -355,6 +359,24 @@ class YouTubePollingService:
         except Exception:  # noqa: BLE001
             return
 
+    def _attempt_fetch_and_store_transcript(
+        self,
+        session: Session,
+        video: Video,
+    ) -> None:
+        if self.transcript_service is None:
+            return
+        if video.transcript is not None:
+            return
+
+        try:
+            transcript = self.transcript_service.fetch_transcript(video.youtube_video_id)
+            if transcript:
+                video.transcript = transcript
+                session.flush()
+        except Exception:  # noqa: BLE001
+            return
+
     def _attempt_new_video_telegram(
         self,
         *,
@@ -364,12 +386,17 @@ class YouTubePollingService:
         if self.telegram_service is None:
             return
 
+        transcript_saved = video.transcript is not None
+        transcript_word_count = len(video.transcript.split()) if video.transcript else 0
+
         try:
             self.telegram_service.send_video_notification(
                 TelegramNotificationPayload(
                     channel_title=channel.title,
                     video_title=video.title,
                     youtube_video_id=video.youtube_video_id,
+                    transcript_saved=transcript_saved,
+                    transcript_word_count=transcript_word_count,
                 )
             )
         except TelegramDeliveryAttemptError:

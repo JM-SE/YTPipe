@@ -12,6 +12,8 @@ class TelegramNotificationPayload:
     channel_title: str | None
     video_title: str | None
     youtube_video_id: str
+    transcript_saved: bool = False
+    transcript_word_count: int = 0
 
 
 class TelegramDeliveryAttemptError(Exception):
@@ -36,7 +38,13 @@ class TelegramDeliveryService:
         title = payload.video_title or payload.youtube_video_id
         video_url = f"https://www.youtube.com/watch?v={payload.youtube_video_id}"
 
-        message = f"\U0001f3a5 Nuevo video de {channel}\n\n{title}\n{video_url}"
+        transcript_line = ""
+        if payload.transcript_saved:
+            transcript_line = f"\n\U0001f4dd Transcripcion: guardada ({payload.transcript_word_count} palabras)"
+        else:
+            transcript_line = "\n\U0001f4dd Transcripcion: no disponible"
+
+        message = f"\U0001f3a5 Nuevo video de {channel}\n\n{title}\n{video_url}{transcript_line}"
 
         try:
             response = httpx.post(

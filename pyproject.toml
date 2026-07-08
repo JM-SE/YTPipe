@@ -14,6 +14,7 @@ dependencies = [
     "pydantic-settings>=2.10.0,<3.0.0",
     "sqlalchemy>=2.0.43,<3.0.0",
     "uvicorn>=0.35.0,<1.0.0",
+    "youtube-transcript-api>=0.6.0,<1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +37,7 @@ include = ["app*"]
     "alembic/versions/20260423_0002_single_user_guard.py",
     "alembic/versions/20260423_0003_user_channel_import_contract.py",
     "alembic/versions/20260424_0004_mobile_push_schema_settings_service.py",
+    "alembic/versions/20260708_0005_add_transcript_to_videos.py",
 ]
 
 [tool.pytest.ini_options]
