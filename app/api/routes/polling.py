@@ -17,6 +17,7 @@ from app.services.auth import GOOGLE_PROVIDER, GoogleOAuthService
 from app.services.email import EmailDeliveryService
 from app.services.mobile_push import MobilePushService
 from app.services.polling import POLLING_PROCESS, YouTubePollingService
+from app.services.telegram import TelegramDeliveryService
 
 router = APIRouter(prefix="/internal", tags=["polling"])
 
@@ -74,6 +75,7 @@ def run_poll(
             daily_quota_budget=settings.poll_quota_daily_budget,
             safety_stop_enabled=settings.poll_quota_safety_stop_enabled,
             mobile_push_service=MobilePushService(settings),
+            telegram_service=TelegramDeliveryService(settings),
         )
         summary = polling_service.run_poll(session, user=user, oauth_account=oauth_account)
         session.commit()

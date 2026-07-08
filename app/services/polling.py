@@ -20,6 +20,7 @@ from app.models.video import Video
 from app.services.auth import GoogleOAuthService
 from app.services.email import EmailDeliveryAttemptError, EmailDeliveryService, EmailNotificationPayload
 from app.services.mobile_push import MobilePushService
+from app.services.telegram import TelegramDeliveryAttemptError, TelegramDeliveryService, TelegramNotificationPayload
 
 POLLING_PROCESS = "polling"
 QUOTA_PROCESS = "quota"
@@ -62,12 +63,14 @@ class YouTubePollingService:
         daily_quota_budget: int,
         safety_stop_enabled: bool,
         mobile_push_service: MobilePushService | None = None,
+        telegram_service: TelegramDeliveryService | None = None,
     ):
         self.auth_service = auth_service
         self.email_service = email_service
         self.daily_quota_budget = max(0, daily_quota_budget)
         self.safety_stop_enabled = safety_stop_enabled
         self.mobile_push_service = mobile_push_service
+        self.telegram_service = telegram_service
 
     def run_poll(self, session: Session, user: User, oauth_account: OAuthAccount) -> PollRunSummary:
         now = datetime.now(UTC)
@@ -352,6 +355,26 @@ class YouTubePollingService:
         except Exception:  # noqa: BLE001
             return
 
+    def _attempt_new_video_telegram(
+        self,
+        *,
+        channel: Channel,
+        video: Video,
+    ) -> None:
+        if self.telegram_service is None:
+            return
+
+        try:
+            self.telegram_service.send_video_notification(
+                TelegramNotificationPayload(
+                    channel_title=channel.title,
+                    video_title=video.title,
+                    youtube_video_id=video.youtube_video_id,
+                )
+            )
+        except TelegramDeliveryAttemptError:
+            return
+
     def _attempt_delivery_send(
         self,
         delivery: NotificationDelivery,
@@ -387,6 +410,8 @@ class YouTubePollingService:
         delivery.last_attempt_at = attempted_at
         delivery.last_error = None
         delivery.status = DELIVERY_DELIVERED_STATUS
+
+        self._attempt_new_video_telegram(channel=channel, video=video)
 
     def _build_quota_context(self, quota_state: SyncState, now: datetime) -> dict[str, Any]:
         existing = quota_state.state_metadata or {}
