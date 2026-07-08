@@ -142,6 +142,10 @@ class YouTubePollingService:
                     channel=channel,
                     video=video,
                 )
+                self._attempt_new_video_telegram(
+                    channel=channel,
+                    video=video,
+                )
                 self._attempt_new_video_push(
                     session=session,
                     user=user,
@@ -385,9 +389,10 @@ class YouTubePollingService:
     ) -> None:
         if self.telegram_service is None:
             return
+        if video.transcript is None:
+            return
 
-        transcript_saved = video.transcript is not None
-        transcript_word_count = len(video.transcript.split()) if video.transcript else 0
+        word_count = len(video.transcript.split())
 
         try:
             self.telegram_service.send_video_notification(
@@ -395,8 +400,8 @@ class YouTubePollingService:
                     channel_title=channel.title,
                     video_title=video.title,
                     youtube_video_id=video.youtube_video_id,
-                    transcript_saved=transcript_saved,
-                    transcript_word_count=transcript_word_count,
+                    transcript_saved=True,
+                    transcript_word_count=word_count,
                 )
             )
         except TelegramDeliveryAttemptError:
@@ -437,8 +442,6 @@ class YouTubePollingService:
         delivery.last_attempt_at = attempted_at
         delivery.last_error = None
         delivery.status = DELIVERY_DELIVERED_STATUS
-
-        self._attempt_new_video_telegram(channel=channel, video=video)
 
     def _build_quota_context(self, quota_state: SyncState, now: datetime) -> dict[str, Any]:
         existing = quota_state.state_metadata or {}
