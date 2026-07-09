@@ -120,8 +120,8 @@ class Settings(BaseSettings):
                 errors.append("EMAIL_DELIVERY_MODE must be `resend` when APP_ENV=production.")
             self._require_non_placeholder("RESEND_API_KEY", self.resend_api_key, "replace-me", errors)
             self._require_non_placeholder("RESEND_FROM_EMAIL", self.resend_from_email, "replace-me", errors)
-        elif email_mode not in {"fake", "resend"}:
-            errors.append("EMAIL_DELIVERY_MODE must be either `fake` or `resend`.")
+        elif email_mode not in {"fake", "resend", "disabled"}:
+            errors.append("EMAIL_DELIVERY_MODE must be `fake`, `resend`, or `disabled`.")
 
         if errors:
             formatted = "; ".join(errors)

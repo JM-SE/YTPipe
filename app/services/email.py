@@ -9,6 +9,7 @@ from app.core.settings import Settings
 
 FAKE_EMAIL_MODE = "fake"
 RESEND_EMAIL_MODE = "resend"
+DISABLED_EMAIL_MODE = "disabled"
 PRODUCTION_ENVS = {"production", "prod"}
 
 
@@ -36,7 +37,7 @@ class EmailDeliveryService:
         self._validate_configuration()
 
     def send_video_notification(self, payload: EmailNotificationPayload) -> None:
-        if self.mode == FAKE_EMAIL_MODE:
+        if self.mode in {FAKE_EMAIL_MODE, DISABLED_EMAIL_MODE}:
             return
 
         subject = f"Nuevo video: {payload.video_title or payload.youtube_video_id}"
@@ -74,10 +75,10 @@ class EmailDeliveryService:
         raise EmailDeliveryAttemptError(error_message, retryable=retryable)
 
     def _validate_configuration(self) -> None:
-        if self.mode not in {RESEND_EMAIL_MODE, FAKE_EMAIL_MODE}:
-            raise ValueError("EMAIL_DELIVERY_MODE must be either 'resend' or 'fake'.")
+        if self.mode not in {RESEND_EMAIL_MODE, FAKE_EMAIL_MODE, DISABLED_EMAIL_MODE}:
+            raise ValueError("EMAIL_DELIVERY_MODE must be 'resend', 'fake', or 'disabled'.")
 
-        if self.mode == FAKE_EMAIL_MODE and self.app_env in PRODUCTION_ENVS:
+        if self.mode in {FAKE_EMAIL_MODE, DISABLED_EMAIL_MODE} and self.app_env in PRODUCTION_ENVS:
             raise ValueError("EMAIL_DELIVERY_MODE=fake is not allowed in production environments.")
 
         if self.mode == RESEND_EMAIL_MODE:
