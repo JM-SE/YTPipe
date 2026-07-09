@@ -20,6 +20,7 @@ from app.models.video import Video
 from app.services.auth import GoogleOAuthService
 from app.services.email import EmailDeliveryAttemptError, EmailDeliveryService, EmailNotificationPayload
 from app.services.mobile_push import MobilePushService
+from app.services.summarization import SummarizationService
 from app.services.telegram import TelegramDeliveryAttemptError, TelegramDeliveryService, TelegramNotificationPayload
 from app.services.transcript import TranscriptService
 
@@ -66,6 +67,7 @@ class YouTubePollingService:
         mobile_push_service: MobilePushService | None = None,
         telegram_service: TelegramDeliveryService | None = None,
         transcript_service: TranscriptService | None = None,
+        summarization_service: SummarizationService | None = None,
     ):
         self.auth_service = auth_service
         self.email_service = email_service
@@ -74,6 +76,7 @@ class YouTubePollingService:
         self.mobile_push_service = mobile_push_service
         self.telegram_service = telegram_service
         self.transcript_service = transcript_service
+        self.summarization_service = summarization_service
 
     def run_poll(self, session: Session, user: User, oauth_account: OAuthAccount) -> PollRunSummary:
         now = datetime.now(UTC)
@@ -135,6 +138,7 @@ class YouTubePollingService:
 
                 video = self._get_or_create_video(session, channel.id, latest_upload)
                 self._attempt_fetch_and_store_transcript(session, video)
+                self._attempt_summarize_transcript(session, video)
                 delivery = self._get_or_create_delivery(session, user.id, video.id)
                 self._attempt_initial_delivery_send(
                     delivery=delivery,
@@ -381,6 +385,26 @@ class YouTubePollingService:
         except Exception:  # noqa: BLE001
             return
 
+    def _attempt_summarize_transcript(
+        self,
+        session: Session,
+        video: Video,
+    ) -> None:
+        if self.summarization_service is None:
+            return
+        if video.summary is not None:
+            return
+        if video.transcript is None:
+            return
+
+        try:
+            summary = self.summarization_service.summarize(video.transcript)
+            if summary:
+                video.summary = summary
+                session.flush()
+        except Exception:  # noqa: BLE001
+            return
+
     def _attempt_new_video_telegram(
         self,
         *,
@@ -389,10 +413,8 @@ class YouTubePollingService:
     ) -> None:
         if self.telegram_service is None:
             return
-        if video.transcript is None:
+        if video.summary is None:
             return
-
-        word_count = len(video.transcript.split())
 
         try:
             self.telegram_service.send_video_notification(
@@ -400,8 +422,7 @@ class YouTubePollingService:
                     channel_title=channel.title,
                     video_title=video.title,
                     youtube_video_id=video.youtube_video_id,
-                    transcript_saved=True,
-                    transcript_word_count=word_count,
+                    summary=video.summary,
                 )
             )
         except TelegramDeliveryAttemptError:

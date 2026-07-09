@@ -15,6 +15,7 @@ class Video(TimestampMixin, Base):
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     channel = relationship("Channel", back_populates="videos")
     notification_deliveries = relationship("NotificationDelivery", back_populates="video")
