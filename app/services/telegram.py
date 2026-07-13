@@ -67,6 +67,31 @@ class TelegramDeliveryService:
         retryable = self._is_retryable_status(response.status_code)
         raise TelegramDeliveryAttemptError(error_message, retryable=retryable)
 
+    def send_message(self, text: str) -> None:
+        if not self.enabled:
+            return
+
+        try:
+            response = httpx.post(
+                f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
+                json={
+                    "chat_id": self.chat_id,
+                    "text": text,
+                },
+                timeout=10.0,
+            )
+        except httpx.TimeoutException as exc:
+            raise TelegramDeliveryAttemptError("Telegram delivery timeout.", retryable=True) from exc
+        except httpx.TransportError as exc:
+            raise TelegramDeliveryAttemptError("Telegram delivery network error.", retryable=True) from exc
+
+        if 200 <= response.status_code < 300:
+            return
+
+        error_message = self._extract_error_message(response)
+        retryable = self._is_retryable_status(response.status_code)
+        raise TelegramDeliveryAttemptError(error_message, retryable=retryable)
+
     def _validate_configuration(self) -> None:
         if not self.enabled:
             return

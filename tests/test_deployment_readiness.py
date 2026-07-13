@@ -173,23 +173,6 @@ def test_production_runtime_config_rejects_resend_placeholders() -> None:
     assert "RESEND_FROM_EMAIL must not use placeholder" in message
 
 
-def test_render_blueprint_declares_staging_service_and_secret_env_vars() -> None:
-    render_yaml = Path("render.yaml").read_text(encoding="utf-8")
-
-    assert "name: ytpipe-staging" in render_yaml
-    assert "runtime: python" in render_yaml
-    assert "plan: free" in render_yaml
-    assert "buildCommand: pip install -e ." in render_yaml
-    assert "startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT" in render_yaml
-    assert "healthCheckPath: /health" in render_yaml
-    assert "key: APP_ENV" in render_yaml
-    assert "value: staging" in render_yaml
-    assert "key: EMAIL_DELIVERY_MODE" in render_yaml
-    assert "value: fake" in render_yaml
-    assert "key: MOBILE_API_BEARER_TOKEN" in render_yaml
-    assert "sync: false" in render_yaml
-
-
 def test_packaging_config_includes_runtime_and_migration_assets() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 

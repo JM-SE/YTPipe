@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     telegram_notifications_enabled: bool = Field(default=False, alias="TELEGRAM_NOTIFICATIONS_ENABLED")
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
+    pipeline_startup_batch_size: int = Field(default=5, alias="PIPELINE_STARTUP_BATCH_SIZE")
+    pipeline_startup_batch_delay_seconds: float = Field(default=30.0, alias="PIPELINE_STARTUP_BATCH_DELAY_SECONDS")
     database_url: str = Field(
         default="postgresql+psycopg://postgres:postgres@localhost:5432/ytpipe",
         alias="DATABASE_URL",

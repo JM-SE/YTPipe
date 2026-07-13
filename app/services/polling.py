@@ -20,8 +20,9 @@ from app.models.video import Video
 from app.services.auth import GoogleOAuthService
 from app.services.email import EmailDeliveryAttemptError, EmailDeliveryService, EmailNotificationPayload
 from app.services.mobile_push import MobilePushService
+from app.services.pipeline import PipelineService
 from app.services.summarization import SummarizationService
-from app.services.telegram import TelegramDeliveryAttemptError, TelegramDeliveryService, TelegramNotificationPayload
+from app.services.telegram import TelegramDeliveryService
 from app.services.transcript import TranscriptService
 
 POLLING_PROCESS = "polling"
@@ -68,6 +69,7 @@ class YouTubePollingService:
         telegram_service: TelegramDeliveryService | None = None,
         transcript_service: TranscriptService | None = None,
         summarization_service: SummarizationService | None = None,
+        pipeline_service: PipelineService | None = None,
     ):
         self.auth_service = auth_service
         self.email_service = email_service
@@ -77,6 +79,7 @@ class YouTubePollingService:
         self.telegram_service = telegram_service
         self.transcript_service = transcript_service
         self.summarization_service = summarization_service
+        self.pipeline_service = pipeline_service
 
     def run_poll(self, session: Session, user: User, oauth_account: OAuthAccount) -> PollRunSummary:
         now = datetime.now(UTC)
@@ -114,6 +117,7 @@ class YouTubePollingService:
         new_videos_detected = 0
         channel_errors: list[dict[str, Any]] = []
 
+        self._process_pending_pipeline_stages(session, user)
         self._process_pending_initial_deliveries(session, user)
         self._process_pending_retry_deliveries(session, user)
 
@@ -137,16 +141,11 @@ class YouTubePollingService:
                     continue
 
                 video = self._get_or_create_video(session, channel.id, latest_upload)
-                self._attempt_fetch_and_store_transcript(session, video)
-                self._attempt_summarize_transcript(session, video)
+                self._process_new_video_pipeline(session, user, channel, video)
                 delivery = self._get_or_create_delivery(session, user.id, video.id)
                 self._attempt_initial_delivery_send(
                     delivery=delivery,
                     user=user,
-                    channel=channel,
-                    video=video,
-                )
-                self._attempt_new_video_telegram(
                     channel=channel,
                     video=video,
                 )
@@ -367,65 +366,35 @@ class YouTubePollingService:
         except Exception:  # noqa: BLE001
             return
 
-    def _attempt_fetch_and_store_transcript(
+    def _process_pending_pipeline_stages(
         self,
         session: Session,
-        video: Video,
+        user: User,
     ) -> None:
-        if self.transcript_service is None:
+        if self.pipeline_service is None:
             return
-        if video.transcript is not None:
-            return
-
         try:
-            transcript = self.transcript_service.fetch_transcript(video.youtube_video_id)
-            if transcript:
-                video.transcript = transcript
-                session.flush()
-        except Exception:  # noqa: BLE001
+            self.pipeline_service.process_pending_stages(session=session, user=user)
+        except Exception:
             return
 
-    def _attempt_summarize_transcript(
+    def _process_new_video_pipeline(
         self,
         session: Session,
-        video: Video,
-    ) -> None:
-        if self.summarization_service is None:
-            return
-        if video.summary is not None:
-            return
-        if video.transcript is None:
-            return
-
-        try:
-            summary = self.summarization_service.summarize(video.transcript)
-            if summary:
-                video.summary = summary
-                session.flush()
-        except Exception:  # noqa: BLE001
-            return
-
-    def _attempt_new_video_telegram(
-        self,
-        *,
+        user: User,
         channel: Channel,
         video: Video,
     ) -> None:
-        if self.telegram_service is None:
+        if self.pipeline_service is None:
             return
-        if video.summary is None:
-            return
-
         try:
-            self.telegram_service.send_video_notification(
-                TelegramNotificationPayload(
-                    channel_title=channel.title,
-                    video_title=video.title,
-                    youtube_video_id=video.youtube_video_id,
-                    summary=video.summary,
-                )
+            self.pipeline_service.process_new_video_stages(
+                session=session,
+                user=user,
+                channel=channel,
+                video=video,
             )
-        except TelegramDeliveryAttemptError:
+        except Exception:
             return
 
     def _attempt_delivery_send(

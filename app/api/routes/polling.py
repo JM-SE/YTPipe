@@ -16,6 +16,7 @@ from app.models.user import User
 from app.services.auth import GOOGLE_PROVIDER, GoogleOAuthService
 from app.services.email import EmailDeliveryService
 from app.services.mobile_push import MobilePushService
+from app.services.pipeline import PipelineService
 from app.services.polling import POLLING_PROCESS, YouTubePollingService
 from app.services.summarization import SummarizationService
 from app.services.telegram import TelegramDeliveryService
@@ -80,6 +81,13 @@ def run_poll(
             telegram_service=TelegramDeliveryService(settings),
             transcript_service=TranscriptService(settings),
             summarization_service=SummarizationService(settings),
+            pipeline_service=PipelineService(
+                transcript_service=TranscriptService(settings),
+                summarization_service=SummarizationService(settings),
+                telegram_service=TelegramDeliveryService(settings),
+                startup_batch_size=settings.pipeline_startup_batch_size,
+                startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
+            ),
         )
         summary = polling_service.run_poll(session, user=user, oauth_account=oauth_account)
         session.commit()

@@ -1,9 +1,15 @@
+from __future__ import annotations
+
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
+from sqlalchemy import select
 from starlette.responses import HTMLResponse, JSONResponse
 
 from app.api.dependencies import validate_admin_bearer_token
@@ -16,6 +22,14 @@ from app.api.routes.polling import router as polling_router
 from app.api.routes.status import router as status_router
 from app.api.routes.subscriptions import router as subscriptions_router
 from app.core.settings import Settings, get_settings
+from app.db.session import SessionLocal
+from app.models.user import User
+from app.services.pipeline import PipelineService
+from app.services.summarization import SummarizationService
+from app.services.telegram import TelegramDeliveryService
+from app.services.transcript import TranscriptService
+
+logger = logging.getLogger(__name__)
 
 
 PROTECTED_OPENAPI_PATH_PREFIXES = ("/internal/",)
@@ -26,11 +40,20 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
     settings = settings_override or get_settings()
     settings.validate_runtime_config()
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        try:
+            _process_pending_pipeline_startup(settings)
+        except Exception:
+            logger.exception("Startup pipeline processing failed.")
+        yield
+
     app = FastAPI(
         title=settings.app_name,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
     app.add_middleware(
         CORSMiddleware,
@@ -109,6 +132,40 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
 
 def _is_protected_openapi_path(path: str) -> bool:
     return path in PROTECTED_OPENAPI_PATHS or path.startswith(PROTECTED_OPENAPI_PATH_PREFIXES)
+
+
+def _process_pending_pipeline_startup(settings: Settings) -> None:
+    if settings.pipeline_startup_batch_size <= 0:
+        return
+
+    with SessionLocal() as session:
+        user = session.scalar(select(User))
+        if user is None:
+            logger.info("Startup pipeline processing skipped: no user found.")
+            return
+
+        pipeline_service = PipelineService(
+            transcript_service=TranscriptService(settings),
+            summarization_service=SummarizationService(settings),
+            telegram_service=TelegramDeliveryService(settings),
+            startup_batch_size=settings.pipeline_startup_batch_size,
+            startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
+        )
+
+        stats = pipeline_service.process_pending_stages_with_throttling(
+            session=session,
+            user=user,
+        )
+
+        logger.info(
+            "Startup pipeline processing complete: "
+            "processed=%d, succeeded=%d, failed=%d, skipped=%d, fallbacks=%d",
+            stats.stages_processed,
+            stats.stages_succeeded,
+            stats.stages_failed,
+            stats.stages_skipped,
+            stats.fallbacks_sent,
+        )
 
 
 app = create_app()
