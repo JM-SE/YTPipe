@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -23,6 +24,12 @@ from app.services.telegram import TelegramDeliveryService
 from app.services.transcript import TranscriptService
 
 router = APIRouter(prefix="/internal", tags=["polling"])
+
+GOOGLE_REAUTH_REQUIRED_DETAILS = {
+    "Stored Google credentials can no longer be refreshed. Manual re-auth is required.",
+    "Stored Google credentials are not valid. Manual re-auth is required.",
+}
+GOOGLE_REAUTH_ALERT_INTERVAL = timedelta(hours=24)
 
 
 class PollRunResponse(BaseModel):
@@ -91,8 +98,16 @@ def run_poll(
         )
         summary = polling_service.run_poll(session, user=user, oauth_account=oauth_account)
         session.commit()
-    except HTTPException:
+    except HTTPException as exc:
         session.rollback()
+        if _is_google_reauth_required(exc):
+            _record_google_reauth_failure(
+                session=session,
+                user_id=user.id,
+                settings=settings,
+                detail=str(exc.detail),
+            )
+            session.commit()
         raise
     except Exception as exc:  # noqa: BLE001
         session.rollback()
@@ -124,4 +139,89 @@ def run_poll(
         baselines_established=summary.baselines_established,
         new_videos_detected=summary.new_videos_detected,
         quota_blocked=summary.quota_blocked,
+    )
+
+
+def _is_google_reauth_required(exc: HTTPException) -> bool:
+    detail = exc.detail if isinstance(exc.detail, str) else None
+    return exc.status_code == status.HTTP_401_UNAUTHORIZED and detail in GOOGLE_REAUTH_REQUIRED_DETAILS
+
+
+def _record_google_reauth_failure(
+    *,
+    session: Session,
+    user_id: int,
+    settings: Settings,
+    detail: str,
+) -> None:
+    now = datetime.now(UTC)
+    polling_state = session.scalar(
+        select(SyncState).where(
+            SyncState.user_id == user_id,
+            SyncState.process_type == POLLING_PROCESS,
+        )
+    )
+    if polling_state is None:
+        polling_state = SyncState(user_id=user_id, process_type=POLLING_PROCESS)
+        session.add(polling_state)
+
+    metadata = dict(polling_state.state_metadata or {})
+    polling_state.last_error_at = now
+    polling_state.last_error_message = detail
+
+    metadata["google_reauth_required"] = True
+    metadata["google_reauth_last_error"] = detail
+    metadata["google_reauth_detected_at"] = now.isoformat()
+
+    if _should_send_google_reauth_alert(metadata, now):
+        try:
+            telegram_service = TelegramDeliveryService(settings)
+            if telegram_service.enabled:
+                telegram_service.send_message(_build_google_reauth_message(settings))
+                metadata["google_reauth_alert_sent_at"] = now.isoformat()
+                metadata["google_reauth_alert_error"] = None
+            else:
+                metadata["google_reauth_alert_error"] = "Telegram notifications are disabled."
+        except Exception as exc:  # noqa: BLE001
+            metadata["google_reauth_alert_error"] = str(exc)
+
+    polling_state.state_metadata = metadata
+    session.flush()
+
+
+def _should_send_google_reauth_alert(metadata: dict[str, object], now: datetime) -> bool:
+    raw_last_sent_at = metadata.get("google_reauth_alert_sent_at")
+    if not isinstance(raw_last_sent_at, str) or not raw_last_sent_at:
+        return True
+
+    try:
+        last_sent_at = datetime.fromisoformat(raw_last_sent_at)
+    except ValueError:
+        return True
+
+    if last_sent_at.tzinfo is None:
+        last_sent_at = last_sent_at.replace(tzinfo=UTC)
+    else:
+        last_sent_at = last_sent_at.astimezone(UTC)
+
+    return now - last_sent_at >= GOOGLE_REAUTH_ALERT_INTERVAL
+
+
+def _build_google_reauth_message(settings: Settings) -> str:
+    parsed_redirect = urlparse(settings.google_redirect_uri)
+    scheme = parsed_redirect.scheme or "http"
+    netloc = parsed_redirect.netloc or "127.0.0.1:8000"
+    port = parsed_redirect.port or (443 if scheme == "https" else 80)
+    auth_url = f"{scheme}://{netloc}/auth/google"
+
+    return (
+        "⚠️ YTPipe necesita re-auth de Google\n\n"
+        "No se pudo refrescar el token de Google, por lo que el polling de YouTube quedo detenido.\n\n"
+        "Como reautenticar desde la PC principal:\n\n"
+        "1. Abrir un tunel SSH y mantener la terminal abierta:\n"
+        f"   ssh -N -L 127.0.0.1:{port}:127.0.0.1:{port} <usuario>@<homelab-host-o-ip>\n\n"
+        "2. Abrir en el navegador:\n"
+        f"   {auth_url}\n\n"
+        "3. Completar el login de Google.\n\n"
+        "4. Avisar para correr un poll manual y verificar."
     )

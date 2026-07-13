@@ -4,10 +4,12 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from googleapiclient.errors import HttpError
 from httplib2 import Response
 
+import app.api.routes.polling as polling_route_module
 import app.services.polling as polling_module
 from app.api.routes.polling import get_db_session, get_settings
 from app.core.settings import Settings
@@ -41,6 +43,149 @@ def test_run_poll_requires_bearer_token(db_session) -> None:
         app.dependency_overrides.clear()
 
     assert response.status_code == 401
+
+
+def test_run_poll_google_reauth_401_sends_telegram_alert_and_records_state(db_session, monkeypatch) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        GOOGLE_REDIRECT_URI="http://127.0.0.1:8000/auth/callback",
+        TELEGRAM_NOTIFICATIONS_ENABLED=True,
+        TELEGRAM_BOT_TOKEN="bot-token",
+        TELEGRAM_CHAT_ID="chat-id",
+        DATABASE_URL="sqlite://",
+    )
+
+    user = User(email="owner@example.com")
+    db_session.add(user)
+    db_session.flush()
+    db_session.add(
+        OAuthAccount(
+            user_id=user.id,
+            provider="google",
+            access_token="expired-token",
+            refresh_token="refresh",
+            token_expiry=datetime.now(UTC) - timedelta(hours=1),
+        )
+    )
+    db_session.commit()
+
+    def raise_reauth(self, session, oauth_account):  # noqa: ARG001
+        raise HTTPException(
+            status_code=401,
+            detail="Stored Google credentials can no longer be refreshed. Manual re-auth is required.",
+        )
+
+    sent_messages: list[str] = []
+
+    monkeypatch.setattr(polling_module.GoogleOAuthService, "ensure_valid_credentials", raise_reauth)
+    monkeypatch.setattr(
+        polling_route_module.TelegramDeliveryService,
+        "send_message",
+        lambda self, text: sent_messages.append(text),
+    )
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.post(
+            "/internal/run-poll",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+    assert response.json() == {
+        "detail": "Stored Google credentials can no longer be refreshed. Manual re-auth is required.",
+    }
+    assert len(sent_messages) == 1
+    assert "YTPipe necesita re-auth de Google" in sent_messages[0]
+    assert "ssh -N -L 127.0.0.1:8000:127.0.0.1:8000" in sent_messages[0]
+    assert "http://127.0.0.1:8000/auth/google" in sent_messages[0]
+
+    polling_state = db_session.query(SyncState).filter_by(process_type=POLLING_PROCESS).one()
+    assert polling_state.last_error_message == response.json()["detail"]
+    assert polling_state.last_error_at is not None
+    assert polling_state.state_metadata is not None
+    assert polling_state.state_metadata["google_reauth_required"] is True
+    assert polling_state.state_metadata["google_reauth_last_error"] == response.json()["detail"]
+    assert polling_state.state_metadata["google_reauth_alert_sent_at"]
+    assert polling_state.state_metadata["google_reauth_alert_error"] is None
+
+
+def test_run_poll_google_reauth_401_alert_is_throttled_for_24_hours(db_session, monkeypatch) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        GOOGLE_REDIRECT_URI="http://127.0.0.1:8000/auth/callback",
+        TELEGRAM_NOTIFICATIONS_ENABLED=True,
+        TELEGRAM_BOT_TOKEN="bot-token",
+        TELEGRAM_CHAT_ID="chat-id",
+        DATABASE_URL="sqlite://",
+    )
+
+    user = User(email="owner@example.com")
+    db_session.add(user)
+    db_session.flush()
+    db_session.add(
+        OAuthAccount(
+            user_id=user.id,
+            provider="google",
+            access_token="expired-token",
+            refresh_token="refresh",
+            token_expiry=datetime.now(UTC) - timedelta(hours=1),
+        )
+    )
+    db_session.commit()
+
+    def raise_reauth(self, session, oauth_account):  # noqa: ARG001
+        raise HTTPException(
+            status_code=401,
+            detail="Stored Google credentials can no longer be refreshed. Manual re-auth is required.",
+        )
+
+    sent_messages: list[str] = []
+
+    monkeypatch.setattr(polling_module.GoogleOAuthService, "ensure_valid_credentials", raise_reauth)
+    monkeypatch.setattr(
+        polling_route_module.TelegramDeliveryService,
+        "send_message",
+        lambda self, text: sent_messages.append(text),
+    )
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        first = client.post(
+            "/internal/run-poll",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+        polling_state = db_session.query(SyncState).filter_by(process_type=POLLING_PROCESS).one()
+        first_sent_at = polling_state.state_metadata["google_reauth_alert_sent_at"]
+
+        second = client.post(
+            "/internal/run-poll",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first.status_code == 401
+    assert second.status_code == 401
+    assert len(sent_messages) == 1
+
+    polling_state = db_session.query(SyncState).filter_by(process_type=POLLING_PROCESS).one()
+    assert polling_state.state_metadata is not None
+    assert polling_state.state_metadata["google_reauth_alert_sent_at"] == first_sent_at
 
 
 def test_run_poll_quota_blocked_exits_before_channel_processing(db_session, monkeypatch) -> None:
