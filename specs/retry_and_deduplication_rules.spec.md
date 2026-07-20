@@ -3,6 +3,8 @@
 ## Context
 Compact MVP rules for safe delivery retries and notification idempotency, covering email, content pipeline (transcript/summary/Telegram), and fallback notifications.
 
+Incident reconciliation and the single-inference execution rule are defined in `specs/incident_recovery_and_reconciliation.spec.md`.
+
 ## Requirements
 - [x] Define retryable failures, non-retryable failures, status transitions, and uniqueness guarantees.
 - [x] Content pipeline stages (transcript, summary, Telegram) each retry up to 3 total attempts.

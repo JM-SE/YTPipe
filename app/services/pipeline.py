@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Callable
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,6 +19,7 @@ from app.services.telegram import TelegramDeliveryAttemptError, TelegramDelivery
 from app.services.transcript import TranscriptService
 
 logger = logging.getLogger(__name__)
+_SUMMARY_INFERENCE_LOCK = threading.Lock()
 
 STAGE_TRANSCRIPT = "transcript"
 STAGE_SUMMARY = "summary"
@@ -44,6 +47,16 @@ FALLBACK_REASON_TELEGRAM = "No se pudo enviar el mensaje por Telegram después d
 
 @dataclass
 class PipelineProcessingStats:
+    stages_processed: int
+    stages_succeeded: int
+    stages_failed: int
+    stages_skipped: int
+    fallbacks_sent: int
+
+
+@dataclass
+class PipelineDrainStats:
+    videos_processed: int
     stages_processed: int
     stages_succeeded: int
     stages_failed: int
@@ -124,7 +137,7 @@ class PipelineService:
                 stages_succeeded += 1
             elif summary_stage and summary_stage.status == STATUS_FAILED:
                 stages_failed += 1
-        else:
+        elif transcript_stage and transcript_stage.status == STATUS_FAILED:
             self._skip_stage(session, stage_map.get(STAGE_SUMMARY))
             stages_skipped += 1
 
@@ -136,7 +149,7 @@ class PipelineService:
                 stages_succeeded += 1
             elif telegram_stage and telegram_stage.status == STATUS_FAILED:
                 stages_failed += 1
-        else:
+        elif stage_map.get(STAGE_SUMMARY) and stage_map[STAGE_SUMMARY].status == STATUS_FAILED:
             self._skip_stage(session, stage_map.get(STAGE_TELEGRAM))
             stages_skipped += 1
 
@@ -284,6 +297,84 @@ class PipelineService:
             stages_failed=stages_failed,
             stages_skipped=stages_skipped,
             fallbacks_sent=fallbacks_sent,
+        )
+
+    def process_next_pending_video(
+        self,
+        session: Session,
+        user: User,
+    ) -> PipelineProcessingStats:
+        """Advance one recoverable video at a time during normal polling."""
+        row = session.execute(
+            select(Video, Channel)
+            .join(PipelineStage, PipelineStage.video_id == Video.id)
+            .join(Channel, Video.channel_id == Channel.id)
+            .where(
+                PipelineStage.user_id == user.id,
+                PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
+            )
+            .order_by(Video.published_at.asc().nullsfirst(), Video.id.asc())
+            .limit(1)
+        ).first()
+        if row is None:
+            return PipelineProcessingStats(0, 0, 0, 0, 0)
+        video, channel = row
+        return self.process_new_video_stages(session, user, channel, video)
+
+    def drain_pending_videos(
+        self,
+        session: Session,
+        user: User,
+        *,
+        pause_seconds: float,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> PipelineDrainStats:
+        """Process queued videos oldest-first, committing each before the next pause."""
+        total = PipelineProcessingStats(0, 0, 0, 0, 0)
+        videos_processed = 0
+        pause_seconds = max(0.0, pause_seconds)
+
+        pending_video_ids = session.scalars(
+            select(Video.id)
+            .join(PipelineStage, PipelineStage.video_id == Video.id)
+            .where(
+                PipelineStage.user_id == user.id,
+                PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
+            )
+            .group_by(Video.id, Video.published_at)
+            .order_by(Video.published_at.asc().nullsfirst(), Video.id.asc())
+        ).all()
+
+        for index, video_id in enumerate(pending_video_ids):
+            video = session.get(Video, video_id)
+            if video is None:
+                continue
+            channel = session.get(Channel, video.channel_id)
+            if channel is None:
+                continue
+
+            stats = self.process_new_video_stages(session, user, channel, video)
+            session.commit()
+            videos_processed += 1
+            total = PipelineProcessingStats(
+                stages_processed=total.stages_processed + stats.stages_processed,
+                stages_succeeded=total.stages_succeeded + stats.stages_succeeded,
+                stages_failed=total.stages_failed + stats.stages_failed,
+                stages_skipped=total.stages_skipped + stats.stages_skipped,
+                fallbacks_sent=total.fallbacks_sent + stats.fallbacks_sent,
+            )
+
+            if pause_seconds and index < len(pending_video_ids) - 1:
+                logger.info("Waiting %.0f seconds before the next pipeline video.", pause_seconds)
+                sleep(pause_seconds)
+
+        return PipelineDrainStats(
+            videos_processed=videos_processed,
+            stages_processed=total.stages_processed,
+            stages_succeeded=total.stages_succeeded,
+            stages_failed=total.stages_failed,
+            stages_skipped=total.stages_skipped,
+            fallbacks_sent=total.fallbacks_sent,
         )
 
     def process_pending_stages_with_throttling(
@@ -446,7 +537,10 @@ class PipelineService:
         stage.last_attempt_at = attempted_at
 
         try:
-            summary = self.summarization_service.summarize(video.transcript)
+            # llama.cpp runs on the local homelab GPU. Keep every entrypoint to
+            # the model serialized, including retries and incident recovery.
+            with _SUMMARY_INFERENCE_LOCK:
+                summary = self.summarization_service.summarize(video.transcript)
         except Exception as exc:
             summary = None
             stage.last_error = str(exc)
@@ -495,6 +589,7 @@ class PipelineService:
                     video_title=video.title,
                     youtube_video_id=video.youtube_video_id,
                     summary=video.summary,
+                    is_short=bool(video.is_short),
                 )
             )
         except TelegramDeliveryAttemptError as exc:

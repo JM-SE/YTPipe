@@ -3,6 +3,8 @@
 ## Context
 Step-by-step MVP execution flow for `POST /internal/run-poll`.
 
+Normal polling is latest-upload-only. Historical reconciliation after an outage is governed separately by `specs/incident_recovery_and_reconciliation.spec.md` and must not be folded into the normal polling path.
+
 ## Requirements
 - [ ] Define bearer protection, quota gating, lightweight quota-state persistence, sequential processing, baseline behavior, detection behavior, failure handling, retry pickup, aggregate response shape, and final outcome semantics.
 

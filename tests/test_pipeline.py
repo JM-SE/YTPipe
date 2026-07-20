@@ -514,3 +514,61 @@ class TestProcessPendingStagesWithThrottling:
         assert stats.stages_processed >= 1
         db_session.refresh(video)
         assert video.transcript == "some transcript"
+
+
+class TestSequentialVideoDrain:
+    def test_retryable_transcript_keeps_downstream_stages_pending(
+        self, db_session, user, channel, video, transcript_service, telegram_service
+    ):
+        transcript_service.fetch_transcript.side_effect = [None, "recovered transcript"]
+        summarization_service = MagicMock()
+        summarization_service.summarize.return_value = "summary"
+        telegram_service.send_video_notification = MagicMock()
+        service = make_pipeline_service(transcript_service, summarization_service, telegram_service)
+
+        service.process_new_video_stages(db_session, user, channel, video)
+        stages = {stage.stage: stage for stage in db_session.scalars(select(PipelineStage)).all()}
+        assert stages[STAGE_TRANSCRIPT].status == STATUS_PENDING_RETRY
+        assert stages[STAGE_SUMMARY].status == STATUS_PENDING
+        assert stages[STAGE_TELEGRAM].status == STATUS_PENDING
+
+        service.process_new_video_stages(db_session, user, channel, video)
+        assert stages[STAGE_TRANSCRIPT].status == STATUS_COMPLETED
+        assert stages[STAGE_SUMMARY].status == STATUS_COMPLETED
+        assert stages[STAGE_TELEGRAM].status == STATUS_COMPLETED
+
+    def test_drain_processes_videos_oldest_first_with_pause(
+        self, db_session, user, channel, video, transcript_service, telegram_service
+    ):
+        older_video = Video(
+            youtube_video_id="video-older",
+            channel_id=channel.id,
+            title="Older Video",
+            published_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        db_session.add(older_video)
+        db_session.commit()
+
+        transcript_service.fetch_transcript.side_effect = ["older transcript", "newer transcript"]
+        summarization_service = MagicMock()
+        summarization_service.summarize.side_effect = ["older summary", "newer summary"]
+        telegram_service.send_video_notification = MagicMock()
+        service = make_pipeline_service(transcript_service, summarization_service, telegram_service)
+        service.create_stages_for_video(db_session, user.id, video.id)
+        service.create_stages_for_video(db_session, user.id, older_video.id)
+        db_session.commit()
+
+        pauses: list[float] = []
+        stats = service.drain_pending_videos(
+            db_session,
+            user,
+            pause_seconds=60,
+            sleep=pauses.append,
+        )
+
+        assert stats.videos_processed == 2
+        assert pauses == [60]
+        assert [call.args[0] for call in summarization_service.summarize.call_args_list] == [
+            "older transcript",
+            "newer transcript",
+        ]

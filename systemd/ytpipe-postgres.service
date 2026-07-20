@@ -1,0 +1,13 @@
+[Unit]
+Description=YTPipe PostgreSQL container
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker start ytpipe-postgres
+ExecStop=/usr/bin/docker stop -t 30 ytpipe-postgres
+
+[Install]
+WantedBy=multi-user.target

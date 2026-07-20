@@ -43,13 +43,15 @@ class Settings(BaseSettings):
     resend_api_key: str = Field(default="", alias="RESEND_API_KEY")
     resend_from_email: str = Field(default="", alias="RESEND_FROM_EMAIL")
     llama_cpp_base_url: str = Field(default="http://127.0.0.1:8001/v1", alias="LLAMA_CPP_BASE_URL")
-    llama_cpp_timeout: float = Field(default=180.0, alias="LLAMA_CPP_TIMEOUT")
+    llama_cpp_timeout: float = Field(default=300.0, alias="LLAMA_CPP_TIMEOUT")
     llama_cpp_max_tokens: int = Field(default=1024, alias="LLAMA_CPP_MAX_TOKENS")
     telegram_notifications_enabled: bool = Field(default=False, alias="TELEGRAM_NOTIFICATIONS_ENABLED")
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
     pipeline_startup_batch_size: int = Field(default=5, alias="PIPELINE_STARTUP_BATCH_SIZE")
     pipeline_startup_batch_delay_seconds: float = Field(default=30.0, alias="PIPELINE_STARTUP_BATCH_DELAY_SECONDS")
+    pipeline_drain_pause_seconds: float = Field(default=60.0, alias="PIPELINE_DRAIN_PAUSE_SECONDS")
+    reconciliation_max_pages_per_channel: int = Field(default=10, alias="RECONCILIATION_MAX_PAGES_PER_CHANNEL")
     database_url: str = Field(
         default="postgresql+psycopg://postgres:postgres@localhost:5432/ytpipe",
         alias="DATABASE_URL",

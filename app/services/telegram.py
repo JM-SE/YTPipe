@@ -13,6 +13,7 @@ class TelegramNotificationPayload:
     video_title: str | None
     youtube_video_id: str
     summary: str | None = None
+    is_short: bool = False
 
 
 class TelegramDeliveryAttemptError(Exception):
@@ -37,7 +38,8 @@ class TelegramDeliveryService:
         title = payload.video_title or payload.youtube_video_id
         video_url = f"https://www.youtube.com/watch?v={payload.youtube_video_id}"
 
-        message = f"🎬 {title}\n{channel}\n{video_url}"
+        short_prefix = "SHORT: " if payload.is_short else ""
+        message = f"🎬 {short_prefix}{title}\n{channel}\n{video_url}"
 
         if payload.summary:
             summary_text = payload.summary

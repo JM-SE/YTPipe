@@ -152,10 +152,8 @@ def _process_pending_pipeline_startup(settings: Settings) -> None:
             startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
         )
 
-        stats = pipeline_service.process_pending_stages_with_throttling(
-            session=session,
-            user=user,
-        )
+        stats = pipeline_service.process_next_pending_video(session=session, user=user)
+        session.commit()
 
         logger.info(
             "Startup pipeline processing complete: "

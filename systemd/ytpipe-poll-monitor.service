@@ -1,0 +1,17 @@
+[Unit]
+Description=YTPipe monitored poll trigger
+After=network-online.target ytpipe-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jmse
+WorkingDirectory=/home/jmse/labs/YTPipe
+EnvironmentFile=/home/jmse/labs/YTPipe/.env
+Environment=YTPipe_MONITOR_STATE_DIR=/home/jmse/.local/state/ytpipe-poll-monitor
+ExecStart=/home/jmse/labs/YTPipe/scripts/ytpipe-poll-monitor.sh
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

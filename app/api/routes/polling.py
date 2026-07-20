@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import threading
+from collections.abc import Generator
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -30,6 +32,7 @@ GOOGLE_REAUTH_REQUIRED_DETAILS = {
     "Stored Google credentials are not valid. Manual re-auth is required.",
 }
 GOOGLE_REAUTH_ALERT_INTERVAL = timedelta(hours=24)
+_POLL_EXECUTION_LOCK = threading.Lock()
 
 
 class PollRunResponse(BaseModel):
@@ -45,9 +48,33 @@ class ErrorResponse(BaseModel):
     detail: str
 
 
+class ReconciliationResponse(BaseModel):
+    channels_processed: int
+    channels_failed: int
+    videos_discovered: int
+    videos_processed: int
+    channel_errors: list[dict[str, object]]
+
+
+class ReconciliationRequest(BaseModel):
+    process_recovered: bool = False
+
+
+def require_poll_execution_lock() -> Generator[None, None, None]:
+    if not _POLL_EXECUTION_LOCK.acquire(blocking=False):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Another polling or reconciliation run is already active.",
+        )
+    try:
+        yield
+    finally:
+        _POLL_EXECUTION_LOCK.release()
+
+
 @router.post(
     "/run-poll",
-    dependencies=[Depends(require_admin_bearer_token)],
+    dependencies=[Depends(require_admin_bearer_token), Depends(require_poll_execution_lock)],
     response_model=PollRunResponse,
     responses={409: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
     summary="Run monitored-channel poll",
@@ -77,25 +104,7 @@ def run_poll(
         )
 
     try:
-        auth_service = GoogleOAuthService(settings)
-        email_service = EmailDeliveryService(settings)
-        polling_service = YouTubePollingService(
-            auth_service=auth_service,
-            email_service=email_service,
-            daily_quota_budget=settings.poll_quota_daily_budget,
-            safety_stop_enabled=settings.poll_quota_safety_stop_enabled,
-            mobile_push_service=MobilePushService(settings),
-            telegram_service=TelegramDeliveryService(settings),
-            transcript_service=TranscriptService(settings),
-            summarization_service=SummarizationService(settings),
-            pipeline_service=PipelineService(
-                transcript_service=TranscriptService(settings),
-                summarization_service=SummarizationService(settings),
-                telegram_service=TelegramDeliveryService(settings),
-                startup_batch_size=settings.pipeline_startup_batch_size,
-                startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
-            ),
-        )
+        polling_service = _build_polling_service(settings)
         summary = polling_service.run_poll(session, user=user, oauth_account=oauth_account)
         session.commit()
     except HTTPException as exc:
@@ -139,6 +148,89 @@ def run_poll(
         baselines_established=summary.baselines_established,
         new_videos_detected=summary.new_videos_detected,
         quota_blocked=summary.quota_blocked,
+    )
+
+
+@router.post(
+    "/reconcile-missing-uploads",
+    dependencies=[Depends(require_admin_bearer_token), Depends(require_poll_execution_lock)],
+    response_model=ReconciliationResponse,
+    responses={409: {"model": ErrorResponse}, 502: {"model": ErrorResponse}},
+    summary="Recover uploads missed during an incident",
+    description="Pages each monitored uploads playlist back to its durable marker and processes recovered videos oldest-first.",
+)
+def reconcile_missing_uploads(
+    request: ReconciliationRequest,
+    settings: Settings = Depends(get_settings),
+    session: Session = Depends(get_db_session),
+) -> ReconciliationResponse:
+    user = session.scalar(select(User))
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Google auth must complete before reconciliation can run.",
+        )
+
+    oauth_account = session.scalar(
+        select(OAuthAccount).where(
+            OAuthAccount.user_id == user.id,
+            OAuthAccount.provider == GOOGLE_PROVIDER,
+        )
+    )
+    if oauth_account is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Stored Google OAuth credentials are required before reconciliation can run.",
+        )
+
+    try:
+        polling_service = _build_polling_service(settings)
+        summary = polling_service.reconcile_missing_uploads(
+            session,
+            user,
+            oauth_account,
+            max_pages_per_channel=settings.reconciliation_max_pages_per_channel,
+            process_recovered=request.process_recovered,
+            drain_pause_seconds=settings.pipeline_drain_pause_seconds,
+        )
+        session.commit()
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Reconciliation failed. Inspect service logs or reconciliation state for details.",
+        ) from exc
+
+    return ReconciliationResponse(
+        channels_processed=summary.channels_processed,
+        channels_failed=summary.channels_failed,
+        videos_discovered=summary.videos_discovered,
+        videos_processed=summary.videos_processed,
+        channel_errors=summary.channel_errors,
+    )
+
+
+def _build_polling_service(settings: Settings) -> YouTubePollingService:
+    return YouTubePollingService(
+        auth_service=GoogleOAuthService(settings),
+        email_service=EmailDeliveryService(settings),
+        daily_quota_budget=settings.poll_quota_daily_budget,
+        safety_stop_enabled=settings.poll_quota_safety_stop_enabled,
+        mobile_push_service=MobilePushService(settings),
+        telegram_service=TelegramDeliveryService(settings),
+        transcript_service=TranscriptService(settings),
+        summarization_service=SummarizationService(settings),
+        pipeline_service=PipelineService(
+            transcript_service=TranscriptService(settings),
+            summarization_service=SummarizationService(settings),
+            telegram_service=TelegramDeliveryService(settings),
+            startup_batch_size=settings.pipeline_startup_batch_size,
+            startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
+        ),
+        pipeline_drain_pause_seconds=settings.pipeline_drain_pause_seconds,
     )
 
 

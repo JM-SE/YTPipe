@@ -12,6 +12,7 @@ from app.api.dependencies import require_admin_bearer_token
 from app.db.session import get_db_session
 from app.models.channel import Channel
 from app.models.notification_delivery import NotificationDelivery
+from app.models.pipeline_stage import PipelineStage
 from app.models.user import User
 from app.models.video import Video
 
@@ -88,6 +89,25 @@ class ActivityListResponse(BaseModel):
     pagination: ActivityPagination
 
 
+class PipelineDiagnosticItemResponse(BaseModel):
+    video_id: int
+    youtube_video_id: str
+    youtube_url: str
+    video_title: str | None
+    channel_title: str | None
+    stage: str
+    stage_status: str
+    attempt_count: int
+    max_attempts: int
+    last_attempt_at: str | None
+    last_error: str | None
+
+
+class PipelineDiagnosticsResponse(BaseModel):
+    items: list[PipelineDiagnosticItemResponse]
+    pagination: ActivityPagination
+
+
 @router.get(
     "/activity",
     dependencies=[Depends(require_admin_bearer_token)],
@@ -139,6 +159,59 @@ def list_activity(
 
     return ActivityListResponse(
         items=[_serialize_activity_item(delivery, video, channel) for delivery, video, channel in rows],
+        pagination=ActivityPagination(limit=limit, offset=offset, total=total),
+    )
+
+
+@router.get(
+    "/pipeline-diagnostics",
+    dependencies=[Depends(require_admin_bearer_token)],
+    response_model=PipelineDiagnosticsResponse,
+    response_model_exclude_none=True,
+    responses={401: {"model": ErrorResponse}},
+    summary="List pipeline stages needing attention",
+)
+def list_pipeline_diagnostics(
+    limit: int = Query(default=100, ge=1, le=200, description="Page size (1-200)."),
+    offset: int = Query(default=0, ge=0, description="Zero-based row offset."),
+    session: Session = Depends(get_db_session),
+) -> PipelineDiagnosticsResponse:
+    user = session.scalar(select(User))
+    if user is None:
+        return PipelineDiagnosticsResponse(items=[], pagination=ActivityPagination(limit=limit, offset=offset, total=0))
+
+    base_query = (
+        select(PipelineStage, Video, Channel)
+        .join(Video, PipelineStage.video_id == Video.id)
+        .join(Channel, Video.channel_id == Channel.id)
+        .where(
+            PipelineStage.user_id == user.id,
+            PipelineStage.status.in_(("pending", "pending_retry", "failed", "skipped")),
+        )
+    )
+    total = session.scalar(select(func.count()).select_from(base_query.subquery())) or 0
+    rows = session.execute(
+        base_query.order_by(PipelineStage.last_attempt_at.desc().nullslast(), PipelineStage.id.asc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    return PipelineDiagnosticsResponse(
+        items=[
+            PipelineDiagnosticItemResponse(
+                video_id=video.id,
+                youtube_video_id=video.youtube_video_id,
+                youtube_url=f"{YOUTUBE_WATCH_URL_PREFIX}{video.youtube_video_id}",
+                video_title=video.title,
+                channel_title=channel.title,
+                stage=stage.stage,
+                stage_status=stage.status,
+                attempt_count=stage.attempt_count,
+                max_attempts=stage.max_attempts,
+                last_attempt_at=_serialize_datetime(stage.last_attempt_at),
+                last_error=stage.last_error,
+            )
+            for stage, video, channel in rows
+        ],
         pagination=ActivityPagination(limit=limit, offset=offset, total=total),
     )
 

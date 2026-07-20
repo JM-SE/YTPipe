@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+
+SHORTS_TITLE_MARKERS = ("#shorts",)
+SHORTS_MAX_DURATION_SECONDS = 60
+QUOTA_ALERT_THRESHOLDS = (50, 75, 90)
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -20,18 +26,21 @@ from app.models.video import Video
 from app.services.auth import GoogleOAuthService
 from app.services.email import EmailDeliveryAttemptError, EmailDeliveryService, EmailNotificationPayload
 from app.services.mobile_push import MobilePushService
-from app.services.pipeline import PipelineService
+from app.services.pipeline import PipelineDrainStats, PipelineService
 from app.services.summarization import SummarizationService
 from app.services.telegram import TelegramDeliveryService
 from app.services.transcript import TranscriptService
 
 POLLING_PROCESS = "polling"
 QUOTA_PROCESS = "quota"
+RECONCILIATION_PROCESS = "reconciliation"
 UNUSABLE_UPLOADS_PLAYLIST_ERROR = "unusable_uploads_playlist"
 DEFAULT_DELIVERY_STATUS = "pending"
 DELIVERY_PENDING_RETRY_STATUS = "pending_retry"
 DELIVERY_DELIVERED_STATUS = "delivered"
 DELIVERY_FAILED_STATUS = "failed"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -49,6 +58,15 @@ class LatestUpload:
     video_id: str | None
     title: str | None
     published_at: datetime | None
+
+
+@dataclass
+class ReconciliationSummary:
+    channels_processed: int
+    channels_failed: int
+    videos_discovered: int
+    videos_processed: int
+    channel_errors: list[dict[str, Any]]
 
 
 class PollingChannelError(Exception):
@@ -70,6 +88,7 @@ class YouTubePollingService:
         transcript_service: TranscriptService | None = None,
         summarization_service: SummarizationService | None = None,
         pipeline_service: PipelineService | None = None,
+        pipeline_drain_pause_seconds: float = 60.0,
     ):
         self.auth_service = auth_service
         self.email_service = email_service
@@ -80,6 +99,7 @@ class YouTubePollingService:
         self.transcript_service = transcript_service
         self.summarization_service = summarization_service
         self.pipeline_service = pipeline_service
+        self.pipeline_drain_pause_seconds = max(0.0, pipeline_drain_pause_seconds)
 
     def run_poll(self, session: Session, user: User, oauth_account: OAuthAccount) -> PollRunSummary:
         now = datetime.now(UTC)
@@ -117,7 +137,7 @@ class YouTubePollingService:
         new_videos_detected = 0
         channel_errors: list[dict[str, Any]] = []
 
-        self._process_pending_pipeline_stages(session, user)
+        self._drain_pending_pipeline_videos(session, user)
         self._process_pending_initial_deliveries(session, user)
         self._process_pending_retry_deliveries(session, user)
 
@@ -141,7 +161,9 @@ class YouTubePollingService:
                     continue
 
                 video = self._get_or_create_video(session, channel.id, latest_upload)
-                self._process_new_video_pipeline(session, user, channel, video)
+                self._attempt_detect_and_mark_short(session, youtube, video, quota_context)
+                if self.pipeline_service is not None:
+                    self.pipeline_service.create_stages_for_video(session, user.id, video.id)
                 delivery = self._get_or_create_delivery(session, user.id, video.id)
                 self._attempt_initial_delivery_send(
                     delivery=delivery,
@@ -183,6 +205,11 @@ class YouTubePollingService:
                     }
                 )
 
+        # Persist newly detected videos and stages before their sequential drain.
+        # This keeps an interruption resumable without skipping newer uploads.
+        session.flush()
+        self._drain_pending_pipeline_videos(session, user)
+
         run_outcome = self._resolve_run_outcome(channels_processed, channels_failed)
         summary = PollRunSummary(
             run_outcome=run_outcome,
@@ -193,10 +220,127 @@ class YouTubePollingService:
             quota_blocked=False,
         )
 
+        self._check_and_send_quota_alert(session, user, quota_context)
         self._write_quota_state(quota_state, quota_context, now)
         self._write_polling_state(polling_state, summary, channel_errors, now)
         session.flush()
         return summary
+
+    def reconcile_missing_uploads(
+        self,
+        session: Session,
+        user: User,
+        oauth_account: OAuthAccount,
+        *,
+        max_pages_per_channel: int,
+        process_recovered: bool,
+        drain_pause_seconds: float | None = None,
+    ) -> ReconciliationSummary:
+        """Recover uploads after each durable marker without changing normal polling."""
+        now = datetime.now(UTC)
+        quota_state = self._get_or_create_sync_state(session, user.id, QUOTA_PROCESS)
+        quota_context = self._build_quota_context(quota_state, now)
+        credentials = self.auth_service.ensure_valid_credentials(session, oauth_account)
+        youtube = build("youtube", "v3", credentials=credentials, cache_discovery=False)
+        monitored_rows = session.execute(
+            select(UserChannel, Channel)
+            .join(Channel, UserChannel.channel_id == Channel.id)
+            .where(UserChannel.user_id == user.id, UserChannel.is_monitored.is_(True))
+            .order_by(UserChannel.id.asc())
+        ).all()
+
+        channel_errors: list[dict[str, Any]] = []
+        channels_processed = 0
+        channels_failed = 0
+        videos_discovered = 0
+
+        for user_channel, channel in monitored_rows:
+            if user_channel.baseline_established_at is None or not user_channel.last_seen_video_id:
+                channel_errors.append(self._reconciliation_error(channel, "missing_baseline", "Channel has no durable baseline."))
+                channels_failed += 1
+                continue
+
+            try:
+                uploads, marker_found = self._fetch_uploads_since_marker(
+                    youtube,
+                    channel,
+                    user_channel.last_seen_video_id,
+                    max_pages=max_pages_per_channel,
+                    quota_context=quota_context,
+                )
+                if not marker_found:
+                    channel_errors.append(
+                        self._reconciliation_error(
+                            channel,
+                            "marker_not_found",
+                            "Stored channel marker was not found within the reconciliation page limit.",
+                        )
+                    )
+                    channels_failed += 1
+                    continue
+
+                # The playlist is newest-first. Persist the entire window before
+                # attempting content work so an interruption is safely resumable.
+                for upload in reversed(uploads):
+                    video = self._get_or_create_video(session, channel.id, upload)
+                    self._attempt_detect_and_mark_short(session, youtube, video, quota_context)
+                    if self.pipeline_service is not None:
+                        self.pipeline_service.create_stages_for_video(session, user.id, video.id)
+
+                if uploads:
+                    user_channel.last_seen_video_id = uploads[0].video_id
+                    videos_discovered += len(uploads)
+                channels_processed += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Reconciliation failed for channel %s", channel.youtube_channel_id)
+                channel_errors.append(self._reconciliation_error(channel, "reconciliation_failed", str(exc)))
+                channels_failed += 1
+
+        session.flush()
+
+        self._check_and_send_quota_alert(session, user, quota_context)
+        self._write_quota_state(quota_state, quota_context, now)
+
+        videos_processed = 0
+        if process_recovered:
+            session.commit()
+            try:
+                drain_stats = self._drain_pending_pipeline_videos(
+                    session,
+                    user,
+                    pause_seconds=drain_pause_seconds,
+                )
+                videos_processed = drain_stats.videos_processed
+            except Exception as exc:
+                reconciliation_state = self._get_or_create_sync_state(session, user.id, RECONCILIATION_PROCESS)
+                reconciliation_state.last_error_at = datetime.now(UTC)
+                reconciliation_state.last_error_message = f"Reconciliation drain failed: {exc}"
+                session.commit()
+                raise
+
+        reconciliation_state = self._get_or_create_sync_state(session, user.id, RECONCILIATION_PROCESS)
+        reconciliation_state.state_metadata = {
+            "channels_processed": channels_processed,
+            "channels_failed": channels_failed,
+            "videos_discovered": videos_discovered,
+            "videos_processed": videos_processed,
+            "channel_errors": channel_errors,
+        }
+        if channel_errors:
+            reconciliation_state.last_error_at = now
+            reconciliation_state.last_error_message = f"{len(channel_errors)} channel(s) need reconciliation review."
+        else:
+            reconciliation_state.last_success_at = now
+            reconciliation_state.last_error_at = None
+            reconciliation_state.last_error_message = None
+        session.flush()
+        return ReconciliationSummary(
+            channels_processed=channels_processed,
+            channels_failed=channels_failed,
+            videos_discovered=videos_discovered,
+            videos_processed=videos_processed,
+            channel_errors=channel_errors,
+        )
 
     def record_polling_error(self, session: Session, user_id: int, message: str) -> None:
         polling_state = self._get_or_create_sync_state(session, user_id, POLLING_PROCESS)
@@ -239,6 +383,72 @@ class YouTubePollingService:
             title=snippet.get("title"),
             published_at=self._parse_youtube_datetime(snippet.get("publishedAt")),
         )
+
+    def _fetch_uploads_since_marker(
+        self,
+        youtube: Any,
+        channel: Channel,
+        marker: str,
+        *,
+        max_pages: int,
+        quota_context: dict[str, Any],
+    ) -> tuple[list[LatestUpload], bool]:
+        if not channel.uploads_playlist_id:
+            raise PollingChannelError(
+                UNUSABLE_UPLOADS_PLAYLIST_ERROR,
+                "Channel does not expose a usable uploads playlist.",
+            )
+
+        page_token: str | None = None
+        uploads: list[LatestUpload] = []
+        for _ in range(max(1, max_pages)):
+            if quota_context["quota_blocked"]:
+                raise PollingChannelError("quota_blocked", "YouTube quota safety stop is active.")
+            quota_context["last_run_estimated_units"] += 1
+            quota_context["estimated_units_used_today"] += 1
+            quota_context["quota_blocked"] = (
+                self.safety_stop_enabled
+                and quota_context["estimated_units_used_today"] >= self.daily_quota_budget
+            )
+            quota_context["safety_stop_active"] = quota_context["quota_blocked"]
+            response = (
+                youtube.playlistItems()
+                .list(
+                    part="snippet,contentDetails",
+                    playlistId=channel.uploads_playlist_id,
+                    maxResults=50,
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+            for item in response.get("items", []):
+                snippet = item.get("snippet", {})
+                content_details = item.get("contentDetails", {})
+                video_id = content_details.get("videoId")
+                if video_id == marker:
+                    return uploads, True
+                if video_id:
+                    uploads.append(
+                        LatestUpload(
+                            video_id=video_id,
+                            title=snippet.get("title"),
+                            published_at=self._parse_youtube_datetime(snippet.get("publishedAt")),
+                        )
+                    )
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+        return uploads, False
+
+    @staticmethod
+    def _reconciliation_error(channel: Channel, code: str, message: str) -> dict[str, Any]:
+        return {
+            "channel_id": channel.id,
+            "youtube_channel_id": channel.youtube_channel_id,
+            "title": channel.title,
+            "error_code": code,
+            "error_message": message,
+        }
 
     def _get_or_create_video(self, session: Session, channel_id: int, latest_upload: LatestUpload) -> Video:
         if not latest_upload.video_id:
@@ -366,36 +576,25 @@ class YouTubePollingService:
         except Exception:  # noqa: BLE001
             return
 
-    def _process_pending_pipeline_stages(
+    def _drain_pending_pipeline_videos(
         self,
         session: Session,
         user: User,
-    ) -> None:
+        *,
+        pause_seconds: float | None = None,
+    ) -> PipelineDrainStats:
         if self.pipeline_service is None:
-            return
+            return PipelineDrainStats(0, 0, 0, 0, 0, 0)
         try:
-            self.pipeline_service.process_pending_stages(session=session, user=user)
-        except Exception:
-            return
-
-    def _process_new_video_pipeline(
-        self,
-        session: Session,
-        user: User,
-        channel: Channel,
-        video: Video,
-    ) -> None:
-        if self.pipeline_service is None:
-            return
-        try:
-            self.pipeline_service.process_new_video_stages(
+            stats = self.pipeline_service.drain_pending_videos(
                 session=session,
                 user=user,
-                channel=channel,
-                video=video,
+                pause_seconds=self.pipeline_drain_pause_seconds if pause_seconds is None else pause_seconds,
             )
+            return stats
         except Exception:
-            return
+            logger.exception("Pending pipeline video drain failed.")
+            raise
 
     def _attempt_delivery_send(
         self,
@@ -440,6 +639,12 @@ class YouTubePollingService:
         estimated_used_today = int(existing.get("estimated_units_used_today", 0)) if existing_day == day else 0
         quota_blocked = self.safety_stop_enabled and estimated_used_today >= self.daily_quota_budget
 
+        raw_alerts = existing.get("quota_alerts_sent")
+        if existing_day == day and isinstance(raw_alerts, dict):
+            quota_alerts_sent = raw_alerts
+        else:
+            quota_alerts_sent = {"day": day, "thresholds": []}
+
         return {
             "usage_day": day,
             "daily_quota_budget": self.daily_quota_budget,
@@ -449,6 +654,7 @@ class YouTubePollingService:
             "safety_stop_active": quota_blocked,
             "safety_stop_triggered_at": now.isoformat() if quota_blocked else existing.get("safety_stop_triggered_at"),
             "quota_blocked": quota_blocked,
+            "quota_alerts_sent": quota_alerts_sent,
         }
 
     def _write_quota_state(self, quota_state: SyncState, quota_context: dict[str, Any], now: datetime) -> None:
@@ -463,6 +669,7 @@ class YouTubePollingService:
             "safety_stop_enabled": quota_context["safety_stop_enabled"],
             "safety_stop_triggered_at": quota_context["safety_stop_triggered_at"],
             "usage_day": quota_context["usage_day"],
+            "quota_alerts_sent": quota_context.get("quota_alerts_sent", {"day": quota_context["usage_day"], "thresholds": []}),
         }
 
     def _write_polling_state(
@@ -536,3 +743,125 @@ class YouTubePollingService:
             return None
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         return parsed.astimezone(UTC)
+
+    def _attempt_detect_and_mark_short(
+        self,
+        session: Session,
+        youtube: Any,
+        video: Video,
+        quota_context: dict[str, Any],
+    ) -> None:
+        if video.is_short is not None:
+            return
+
+        if video.title and self._title_indicates_short(video.title):
+            video.is_short = True
+            session.flush()
+            return
+
+        if not video.youtube_video_id:
+            return
+
+        try:
+            duration_seconds = self._fetch_video_duration_seconds(
+                youtube, video.youtube_video_id, quota_context
+            )
+        except Exception:  # noqa: BLE001
+            return
+
+        if duration_seconds is None:
+            return
+
+        video.is_short = duration_seconds <= SHORTS_MAX_DURATION_SECONDS
+        session.flush()
+
+    @staticmethod
+    def _title_indicates_short(title: str) -> bool:
+        lower_title = title.lower()
+        return any(marker in lower_title for marker in SHORTS_TITLE_MARKERS)
+
+    def _fetch_video_duration_seconds(
+        self,
+        youtube: Any,
+        youtube_video_id: str,
+        quota_context: dict[str, Any],
+    ) -> int | None:
+        quota_context["last_run_estimated_units"] += 1
+        quota_context["estimated_units_used_today"] += 1
+
+        response = (
+            youtube.videos()
+            .list(part="contentDetails", id=youtube_video_id)
+            .execute()
+        )
+        items = response.get("items", [])
+        if not items:
+            return None
+
+        duration = items[0].get("contentDetails", {}).get("duration")
+        if not duration:
+            return None
+
+        return self._parse_iso8601_duration_seconds(duration)
+
+    @staticmethod
+    def _parse_iso8601_duration_seconds(value: str) -> int | None:
+        match = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", value)
+        if not match:
+            return None
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2) or 0)
+        seconds = int(match.group(3) or 0)
+        return hours * 3600 + minutes * 60 + seconds
+
+    def _check_and_send_quota_alert(
+        self,
+        session: Session,
+        user: User,
+        quota_context: dict[str, Any],
+    ) -> None:
+        daily_budget = quota_context.get("daily_quota_budget", 0)
+        used_today = quota_context.get("estimated_units_used_today", 0)
+        if daily_budget <= 0:
+            return
+
+        usage_percent = int((used_today / daily_budget) * 100)
+        if self.telegram_service is None or not self.telegram_service.enabled:
+            return
+
+        now = datetime.now(UTC)
+        day = now.date().isoformat()
+
+        quota_alerts_sent = quota_context.get("quota_alerts_sent")
+        if not isinstance(quota_alerts_sent, dict) or quota_alerts_sent.get("day") != day:
+            quota_alerts_sent = {"day": day, "thresholds": []}
+
+        for threshold in QUOTA_ALERT_THRESHOLDS:
+            if usage_percent >= threshold and threshold not in quota_alerts_sent["thresholds"]:
+                try:
+                    self.telegram_service.send_message(
+                        self._build_quota_alert_message(used_today, daily_budget, threshold)
+                    )
+                    quota_alerts_sent["thresholds"].append(threshold)
+                except Exception:  # noqa: BLE001
+                    continue
+
+        quota_context["quota_alerts_sent"] = quota_alerts_sent
+
+    @staticmethod
+    def _build_quota_alert_message(used_today: int, daily_budget: int, threshold: int) -> str:
+        if threshold >= 90:
+            emoji = "🔴"
+            extra = "El polling se detendra pronto. Revisa canales monitoreados o espera al reset diario."
+        elif threshold >= 75:
+            emoji = "⚠️"
+            extra = "Si llegas al 100%, el polling se detendra hasta manana."
+        else:
+            emoji = "ℹ️"
+            extra = "Vas por la mitad del presupuesto diario."
+
+        return (
+            f"{emoji} Quota alert: {threshold}% usada\n\n"
+            f"YouTube API quota usage: {used_today}/{daily_budget} units hoy.\n\n"
+            f"{extra}"
+        )
