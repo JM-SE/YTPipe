@@ -1,8 +1,12 @@
 from app.core.settings import Settings
+import httpx
+import pytest
+
 from app.services.summarization import (
     DIRECT_TRANSCRIPT_CHARACTER_LIMIT,
     TRANSCRIPT_CHUNK_CHARACTER_LIMIT,
     SummarizationService,
+    SummarizationRequestError,
 )
 
 
@@ -30,3 +34,16 @@ def test_split_transcript_preserves_all_text() -> None:
 
     assert " ".join(chunks).split() == transcript.split()
     assert all(len(chunk) <= TRANSCRIPT_CHUNK_CHARACTER_LIMIT for chunk in chunks[:-1])
+
+
+def test_http_error_preserves_provider_detail(monkeypatch) -> None:
+    service = SummarizationService(Settings(DATABASE_URL="sqlite://"))
+    response = httpx.Response(
+        500,
+        json={"error": {"message": "Vulkan device lost"}},
+        request=httpx.Request("POST", "http://127.0.0.1:8001/v1/chat/completions"),
+    )
+    monkeypatch.setattr("app.services.summarization.httpx.post", lambda *args, **kwargs: response)
+
+    with pytest.raises(SummarizationRequestError, match="HTTP 500: Vulkan device lost"):
+        service.summarize("short transcript")

@@ -41,11 +41,12 @@ send_telegram() {
 run_poll() {
     local now_epoch
     local last_failure_epoch=0
+    local poll_failure_reason
 
     now_epoch="$(date +%s)"
-    if curl --silent --show-error --fail-with-body --max-time "$poll_timeout_seconds" \
+    if poll_failure_reason="$(curl --silent --show-error --fail-with-body --max-time "$poll_timeout_seconds" \
         -X POST http://127.0.0.1:8000/internal/run-poll \
-        -H "Authorization: Bearer ${INTERNAL_API_BEARER_TOKEN}" >/dev/null; then
+        -H "Authorization: Bearer ${INTERNAL_API_BEARER_TOKEN}" 2>&1)"; then
         if [[ -f "$failure_file" ]]; then
             rm -f "$failure_file"
             send_telegram "YTPipe recuperado: el polling volvió a responder correctamente."
@@ -59,7 +60,13 @@ run_poll() {
 
     if (( now_epoch - last_failure_epoch >= failure_interval_seconds )); then
         printf '%s\n' "$now_epoch" >"$failure_file"
-        send_telegram "⚠️ YTPipe: el polling falló o agotó el timeout. Revisá PostgreSQL, ytpipe-api y journalctl -u ytpipe-poll-monitor.service."
+        poll_failure_reason="${poll_failure_reason//$'\n'/ }"
+        poll_failure_reason="${poll_failure_reason//$'\r'/ }"
+        poll_failure_reason="${poll_failure_reason:0:300}"
+        if [[ -z "$poll_failure_reason" ]]; then
+            poll_failure_reason="sin detalle devuelto por curl"
+        fi
+        send_telegram "⚠️ YTPipe: el polling falló o agotó el timeout. Causa: ${poll_failure_reason}. Revisá PostgreSQL, ytpipe-api y journalctl -u ytpipe-poll-monitor.service."
     fi
 
     return 1

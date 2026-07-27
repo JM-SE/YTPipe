@@ -23,8 +23,10 @@ from app.api.routes.status import router as status_router
 from app.api.routes.subscriptions import router as subscriptions_router
 from app.core.settings import Settings, get_settings
 from app.db.session import SessionLocal
+from app.models.sync_state import SyncState
 from app.models.user import User
 from app.services.pipeline import PipelineService
+from app.services.polling import SUMMARIZATION_PROCESS
 from app.services.summarization import SummarizationService
 from app.services.telegram import TelegramDeliveryService
 from app.services.transcript import TranscriptService
@@ -144,12 +146,24 @@ def _process_pending_pipeline_startup(settings: Settings) -> None:
             logger.info("Startup pipeline processing skipped: no user found.")
             return
 
+        summarization_state = session.scalar(
+            select(SyncState).where(
+                SyncState.user_id == user.id,
+                SyncState.process_type == SUMMARIZATION_PROCESS,
+            )
+        )
+        summary_paused = bool(
+            summarization_state
+            and (summarization_state.state_metadata or {}).get("paused", False)
+        )
+
         pipeline_service = PipelineService(
             transcript_service=TranscriptService(settings),
             summarization_service=SummarizationService(settings),
             telegram_service=TelegramDeliveryService(settings),
             startup_batch_size=settings.pipeline_startup_batch_size,
             startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
+            summary_paused=summary_paused,
         )
 
         stats = pipeline_service.process_next_pending_video(session=session, user=user)

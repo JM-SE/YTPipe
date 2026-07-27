@@ -26,7 +26,8 @@ from app.models.video import Video
 from app.services.auth import GoogleOAuthService
 from app.services.email import EmailDeliveryAttemptError, EmailDeliveryService, EmailNotificationPayload
 from app.services.mobile_push import MobilePushService
-from app.services.pipeline import PipelineDrainStats, PipelineService
+from app.services.llama_recovery import LlamaRecoveryService
+from app.services.pipeline import SUMMARIZATION_PROCESS, PipelineDrainStats, PipelineService
 from app.services.summarization import SummarizationService
 from app.services.telegram import TelegramDeliveryService
 from app.services.transcript import TranscriptService
@@ -89,6 +90,7 @@ class YouTubePollingService:
         summarization_service: SummarizationService | None = None,
         pipeline_service: PipelineService | None = None,
         pipeline_drain_pause_seconds: float = 60.0,
+        llama_recovery_service: LlamaRecoveryService | None = None,
     ):
         self.auth_service = auth_service
         self.email_service = email_service
@@ -100,11 +102,15 @@ class YouTubePollingService:
         self.summarization_service = summarization_service
         self.pipeline_service = pipeline_service
         self.pipeline_drain_pause_seconds = max(0.0, pipeline_drain_pause_seconds)
+        self.llama_recovery_service = llama_recovery_service
 
     def run_poll(self, session: Session, user: User, oauth_account: OAuthAccount) -> PollRunSummary:
         now = datetime.now(UTC)
         quota_state = self._get_or_create_sync_state(session, user.id, QUOTA_PROCESS)
         polling_state = self._get_or_create_sync_state(session, user.id, POLLING_PROCESS)
+        summarization_state = self._get_or_create_sync_state(session, user.id, SUMMARIZATION_PROCESS)
+        self._load_summary_circuit_state(self.pipeline_service, summarization_state)
+        self._deliver_pending_summary_recovery_alert(summarization_state)
 
         quota_context = self._build_quota_context(quota_state, now)
         if quota_context["quota_blocked"]:
@@ -137,6 +143,7 @@ class YouTubePollingService:
         new_videos_detected = 0
         channel_errors: list[dict[str, Any]] = []
 
+        self._attempt_summary_recovery(session, user, summarization_state)
         self._drain_pending_pipeline_videos(session, user)
         self._process_pending_initial_deliveries(session, user)
         self._process_pending_retry_deliveries(session, user)
@@ -209,6 +216,7 @@ class YouTubePollingService:
         # This keeps an interruption resumable without skipping newer uploads.
         session.flush()
         self._drain_pending_pipeline_videos(session, user)
+        self._finalize_summary_circuit(session, user, summarization_state, now)
 
         run_outcome = self._resolve_run_outcome(channels_processed, channels_failed)
         summary = PollRunSummary(
@@ -239,6 +247,9 @@ class YouTubePollingService:
         """Recover uploads after each durable marker without changing normal polling."""
         now = datetime.now(UTC)
         quota_state = self._get_or_create_sync_state(session, user.id, QUOTA_PROCESS)
+        summarization_state = self._get_or_create_sync_state(session, user.id, SUMMARIZATION_PROCESS)
+        self._load_summary_circuit_state(self.pipeline_service, summarization_state)
+        self._deliver_pending_summary_recovery_alert(summarization_state)
         quota_context = self._build_quota_context(quota_state, now)
         credentials = self.auth_service.ensure_valid_credentials(session, oauth_account)
         youtube = build("youtube", "v3", credentials=credentials, cache_discovery=False)
@@ -305,18 +316,22 @@ class YouTubePollingService:
         if process_recovered:
             session.commit()
             try:
+                self._attempt_summary_recovery(session, user, summarization_state)
                 drain_stats = self._drain_pending_pipeline_videos(
                     session,
                     user,
                     pause_seconds=drain_pause_seconds,
                 )
                 videos_processed = drain_stats.videos_processed
+                self._finalize_summary_circuit(session, user, summarization_state, now)
             except Exception as exc:
                 reconciliation_state = self._get_or_create_sync_state(session, user.id, RECONCILIATION_PROCESS)
                 reconciliation_state.last_error_at = datetime.now(UTC)
                 reconciliation_state.last_error_message = f"Reconciliation drain failed: {exc}"
                 session.commit()
                 raise
+        else:
+            self._finalize_summary_circuit(session, user, summarization_state, now)
 
         reconciliation_state = self._get_or_create_sync_state(session, user.id, RECONCILIATION_PROCESS)
         reconciliation_state.state_metadata = {
@@ -347,6 +362,154 @@ class YouTubePollingService:
         polling_state.last_error_at = datetime.now(UTC)
         polling_state.last_error_message = message
         session.flush()
+
+    @staticmethod
+    def _load_summary_circuit_state(
+        pipeline_service: PipelineService | None,
+        summarization_state: SyncState,
+    ) -> None:
+        if pipeline_service is None:
+            return
+        metadata = summarization_state.state_metadata or {}
+        pipeline_service.summary_paused = bool(metadata.get("paused", False))
+        pipeline_service.summary_pause_reason = metadata.get("last_error")
+        failed_video_id = metadata.get("failed_video_id")
+        pipeline_service.summary_pause_video_id = failed_video_id if isinstance(failed_video_id, int) else None
+
+    def _attempt_summary_recovery(
+        self,
+        session: Session,
+        user: User,
+        summarization_state: SyncState,
+    ) -> None:
+        if self.pipeline_service is None or not self.pipeline_service.summary_paused:
+            return
+        result = self.pipeline_service.attempt_summary_recovery(session, user)
+        if result is False:
+            logger.warning("Summary recovery inference failed; keeping circuit open.")
+        elif result is True:
+            logger.info("Summary recovery inference succeeded; closing circuit.")
+        else:
+            logger.info("Summary recovery deferred: no transcript-ready summary is pending.")
+
+    def _finalize_summary_circuit(
+        self,
+        session: Session,
+        user: User,
+        summarization_state: SyncState,
+        now: datetime,
+    ) -> None:
+        if self.pipeline_service is None:
+            return
+
+        previous = summarization_state.state_metadata or {}
+        was_paused = bool(previous.get("paused", False))
+        is_paused = self.pipeline_service.summary_paused
+        metadata = dict(previous)
+        metadata["paused"] = is_paused
+
+        if is_paused:
+            reason = self.pipeline_service.summary_pause_reason or "Unknown summarization failure."
+            metadata["last_error"] = reason
+            metadata["last_failure_at"] = now.isoformat()
+            if not was_paused:
+                metadata["incident_started_at"] = now.isoformat()
+                metadata["alert_sent"] = False
+
+            restart_message = "Automatic llama.cpp restart is not configured."
+            if self._restart_allowed(metadata, now):
+                result = self.llama_recovery_service.restart() if self.llama_recovery_service else None
+                if result is not None:
+                    metadata["restart_attempted_at"] = now.isoformat()
+                    metadata["restart_succeeded"] = result.succeeded
+                    restart_message = result.reason
+            elif metadata.get("restart_attempted_at"):
+                restart_message = "llama.cpp restart is waiting for the configured cooldown."
+
+            if not metadata.get("alert_sent", False):
+                if self._send_summary_alert(session, user, reason, restart_message):
+                    metadata["alert_sent"] = True
+
+            summarization_state.last_error_at = now
+            summarization_state.last_error_message = reason
+        else:
+            if self.pipeline_service.summary_recovery_succeeded or metadata.get("recovery_pending_alert"):
+                if self._send_summary_recovery_alert():
+                    metadata["recovery_pending_alert"] = False
+            metadata["alert_sent"] = False
+            metadata["paused"] = False
+            summarization_state.last_success_at = now
+            summarization_state.last_error_at = None
+            summarization_state.last_error_message = None
+
+        summarization_state.state_metadata = metadata
+        session.flush()
+
+    def _restart_allowed(self, metadata: dict[str, Any], now: datetime) -> bool:
+        if self.llama_recovery_service is None or not self.llama_recovery_service.enabled:
+            return False
+        last_attempt = metadata.get("restart_attempted_at")
+        if not last_attempt:
+            return True
+        try:
+            elapsed = (now - datetime.fromisoformat(last_attempt)).total_seconds()
+        except (TypeError, ValueError):
+            return True
+        return elapsed >= self.llama_recovery_service.cooldown_seconds
+
+    def _send_summary_alert(
+        self,
+        session: Session,
+        user: User,
+        reason: str,
+        restart_message: str,
+    ) -> bool:
+        if self.telegram_service is None or not self.telegram_service.enabled:
+            return True
+
+        video_id = self.pipeline_service.summary_pause_video_id if self.pipeline_service else None
+        video = session.get(Video, video_id) if video_id is not None else None
+        title = video.title if video and video.title else (video.youtube_video_id if video else "video pendiente")
+        channel = session.get(Channel, video.channel_id) if video else None
+        channel_title = channel.title if channel and channel.title else "Canal desconocido"
+        message = (
+            "⚠️ YTPipe pausó los resúmenes\n\n"
+            f"Video: {title}\n"
+            f"Canal: {channel_title}\n"
+            "Etapa: resumen\n"
+            f"Causa: {reason}\n\n"
+            "Las transcripciones continuarán guardándose.\n"
+            "Los resúmenes pendientes se recuperarán automáticamente.\n\n"
+            f"Reinicio de llama.cpp: {restart_message}"
+        )
+        try:
+            self.telegram_service.send_message(message[:3800])
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not send summary circuit Telegram alert.")
+            return False
+        return True
+
+    def _send_summary_recovery_alert(self) -> bool:
+        if self.telegram_service is None or not self.telegram_service.enabled:
+            return True
+        try:
+            self.telegram_service.send_message(
+                "YTPipe recuperado: llama.cpp volvió a completar una inferencia. "
+                "Se reanudó el procesamiento de resúmenes pendientes."
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not send summary recovery Telegram alert.")
+            return False
+        return True
+
+    def _deliver_pending_summary_recovery_alert(self, summarization_state: SyncState) -> None:
+        metadata = summarization_state.state_metadata or {}
+        if not metadata.get("recovery_pending_alert"):
+            return
+        if self._send_summary_recovery_alert():
+            updated = dict(metadata)
+            updated["recovery_pending_alert"] = False
+            summarization_state.state_metadata = updated
 
     def _fetch_latest_upload(self, youtube: Any, channel: Channel) -> LatestUpload:
         uploads_playlist_id = channel.uploads_playlist_id

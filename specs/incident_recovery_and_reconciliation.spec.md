@@ -17,6 +17,8 @@ Normal polling reads only the latest upload for each monitored channel. This is 
 - [ ] Expose pipeline failures, pending retries, missing summaries, and fallback delivery failures through an authenticated diagnostic endpoint.
 - [ ] Record unexpected pipeline exceptions rather than silently ignoring them.
 - [ ] Add an operational check outside the database-backed application path that alerts Telegram after polling HTTP failures, database unavailability, or timeouts, and sends a recovery alert after the next successful poll.
+- [ ] When a summary inference fails during polling, persist a summarization circuit breaker, alert Telegram with the sanitized cause, continue transcript extraction, and leave summary/Telegram stages pending.
+- [ ] When configured, request one cooldown-protected restart of `llama-server.service` through a narrowly scoped host privilege rule, and resume summaries only after a later real inference succeeds.
 - [ ] Keep operational secrets out of application source. The existing scheduler token rotation is an operator-managed follow-up and is out of scope for this incident recovery.
 
 ## Reconciliation Contract
@@ -49,3 +51,5 @@ Normal polling reads only the latest upload for each monitored channel. This is 
 - [ ] Unexpected pipeline failures are visible in durable diagnostics.
 - [ ] A stopped PostgreSQL container causes a throttled Telegram alert from the host monitor.
 - [ ] The next successful poll causes a Telegram recovery alert.
+- [ ] A llama.cpp failure pauses later summary attempts without losing newly fetched transcripts.
+- [ ] A successful post-restart inference closes the summarization circuit and drains pending summaries.

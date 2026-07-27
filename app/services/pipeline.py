@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.models.channel import Channel
 from app.models.pipeline_stage import PipelineStage
+from app.models.sync_state import SyncState
 from app.models.user import User
 from app.models.video import Video
 from app.services.summarization import SummarizationService
@@ -25,6 +26,7 @@ STAGE_TRANSCRIPT = "transcript"
 STAGE_SUMMARY = "summary"
 STAGE_TELEGRAM = "telegram"
 STAGE_FALLBACK_TELEGRAM = "fallback_telegram"
+SUMMARIZATION_PROCESS = "summarization"
 
 STATUS_PENDING = "pending"
 STATUS_PENDING_RETRY = "pending_retry"
@@ -45,6 +47,11 @@ FALLBACK_REASON_SUMMARY = "No se pudo generar el resumen después de {max_attemp
 FALLBACK_REASON_TELEGRAM = "No se pudo enviar el mensaje por Telegram después de {max_attempts} intentos."
 
 
+def _compact_error(message: str) -> str:
+    compacted = " ".join(message.replace("\n", " ").replace("\r", " ").split())
+    return compacted[:500] or "Unknown summarization failure."
+
+
 @dataclass
 class PipelineProcessingStats:
     stages_processed: int
@@ -52,6 +59,7 @@ class PipelineProcessingStats:
     stages_failed: int
     stages_skipped: int
     fallbacks_sent: int
+    summary_attempted: bool = False
 
 
 @dataclass
@@ -62,6 +70,7 @@ class PipelineDrainStats:
     stages_failed: int
     stages_skipped: int
     fallbacks_sent: int
+    summary_attempted: bool = False
 
 
 class PipelineService:
@@ -72,12 +81,17 @@ class PipelineService:
         telegram_service: TelegramDeliveryService | None = None,
         startup_batch_size: int = 0,
         startup_batch_delay_seconds: float = 30.0,
+        summary_paused: bool = False,
     ):
         self.transcript_service = transcript_service
         self.summarization_service = summarization_service
         self.telegram_service = telegram_service
         self.startup_batch_size = max(0, startup_batch_size)
         self.startup_batch_delay_seconds = max(0, startup_batch_delay_seconds)
+        self.summary_paused = summary_paused
+        self.summary_pause_reason: str | None = None
+        self.summary_pause_video_id: int | None = None
+        self.summary_recovery_succeeded = False
 
     def create_stages_for_video(self, session: Session, user_id: int, video_id: int) -> list[PipelineStage]:
         stages = []
@@ -117,6 +131,7 @@ class PipelineService:
         stages_failed = 0
         stages_skipped = 0
         fallbacks_sent = 0
+        summary_attempted = False
 
         stages = self.create_stages_for_video(session, user.id, video.id)
         stage_map: dict[str, PipelineStage] = {s.stage: s for s in stages}
@@ -130,8 +145,10 @@ class PipelineService:
             stages_failed += 1
 
         if self._can_proceed(transcript_stage):
-            self._attempt_summary_stage(session, stage_map.get(STAGE_SUMMARY), video)
-            stages_processed += 1
+            summary_attempted = self._attempt_summary_stage(
+                session, stage_map.get(STAGE_SUMMARY), video
+            )
+            stages_processed += int(summary_attempted)
             summary_stage = stage_map.get(STAGE_SUMMARY)
             if summary_stage and summary_stage.status == STATUS_COMPLETED:
                 stages_succeeded += 1
@@ -149,7 +166,10 @@ class PipelineService:
                 stages_succeeded += 1
             elif telegram_stage and telegram_stage.status == STATUS_FAILED:
                 stages_failed += 1
-        elif stage_map.get(STAGE_SUMMARY) and stage_map[STAGE_SUMMARY].status == STATUS_FAILED:
+        elif stage_map.get(STAGE_SUMMARY) and stage_map[STAGE_SUMMARY].status in {
+            STATUS_FAILED,
+            STATUS_SKIPPED,
+        }:
             self._skip_stage(session, stage_map.get(STAGE_TELEGRAM))
             stages_skipped += 1
 
@@ -162,12 +182,15 @@ class PipelineService:
             if fallback_sent:
                 fallbacks_sent += 1
 
+        self._persist_summary_pause_state(session, user)
+
         return PipelineProcessingStats(
             stages_processed=stages_processed,
             stages_succeeded=stages_succeeded,
             stages_failed=stages_failed,
             stages_skipped=stages_skipped,
             fallbacks_sent=fallbacks_sent,
+            summary_attempted=summary_attempted,
         )
 
     def process_pending_stages(
@@ -180,6 +203,7 @@ class PipelineService:
         stages_failed = 0
         stages_skipped = 0
         fallbacks_sent = 0
+        summary_attempted = False
 
         pending_rows = session.execute(
             select(PipelineStage, Video, Channel)
@@ -238,8 +262,9 @@ class PipelineService:
                     stages_skipped += 1
                     continue
 
-                self._attempt_summary_stage(session, ps, video)
-                stages_processed += 1
+                attempted = self._attempt_summary_stage(session, ps, video)
+                summary_attempted = summary_attempted or attempted
+                stages_processed += int(attempted)
                 if ps.status == STATUS_COMPLETED:
                     stages_succeeded += 1
                 elif ps.status == STATUS_FAILED:
@@ -291,12 +316,15 @@ class PipelineService:
                 if sent:
                     fallbacks_sent += 1
 
+        self._persist_summary_pause_state(session, user)
+
         return PipelineProcessingStats(
             stages_processed=stages_processed,
             stages_succeeded=stages_succeeded,
             stages_failed=stages_failed,
             stages_skipped=stages_skipped,
             fallbacks_sent=fallbacks_sent,
+            summary_attempted=summary_attempted,
         )
 
     def process_next_pending_video(
@@ -333,6 +361,7 @@ class PipelineService:
         total = PipelineProcessingStats(0, 0, 0, 0, 0)
         videos_processed = 0
         pause_seconds = max(0.0, pause_seconds)
+        summary_attempted = False
 
         pending_video_ids = session.scalars(
             select(Video.id)
@@ -362,9 +391,11 @@ class PipelineService:
                 stages_failed=total.stages_failed + stats.stages_failed,
                 stages_skipped=total.stages_skipped + stats.stages_skipped,
                 fallbacks_sent=total.fallbacks_sent + stats.fallbacks_sent,
+                summary_attempted=total.summary_attempted or stats.summary_attempted,
             )
+            summary_attempted = summary_attempted or stats.summary_attempted
 
-            if pause_seconds and index < len(pending_video_ids) - 1:
+            if pause_seconds and stats.summary_attempted and index < len(pending_video_ids) - 1:
                 logger.info("Waiting %.0f seconds before the next pipeline video.", pause_seconds)
                 sleep(pause_seconds)
 
@@ -375,6 +406,7 @@ class PipelineService:
             stages_failed=total.stages_failed,
             stages_skipped=total.stages_skipped,
             fallbacks_sent=total.fallbacks_sent,
+            summary_attempted=summary_attempted,
         )
 
     def process_pending_stages_with_throttling(
@@ -515,22 +547,24 @@ class PipelineService:
         session: Session,
         stage: PipelineStage | None,
         video: Video,
-    ) -> None:
+    ) -> bool:
         if stage is None:
-            return
+            return False
         if stage.status not in (STATUS_PENDING, STATUS_PENDING_RETRY):
-            return
+            return False
+        if self.summary_paused:
+            return False
         if video.summary is not None:
             stage.status = STATUS_COMPLETED
-            return
+            return False
         if self.summarization_service is None:
             stage.status = STATUS_FAILED
             stage.last_error = "Summarization service not available."
-            return
+            return True
         if video.transcript is None:
             stage.status = STATUS_FAILED
             stage.last_error = "No transcript available to summarize."
-            return
+            return True
 
         attempted_at = datetime.now(UTC)
         stage.attempt_count += 1
@@ -543,13 +577,18 @@ class PipelineService:
                 summary = self.summarization_service.summarize(video.transcript)
         except Exception as exc:
             summary = None
-            stage.last_error = str(exc)
+            stage.last_error = _compact_error(str(exc))
+            self.summary_paused = True
+            self.summary_pause_reason = stage.last_error
+            self.summary_pause_video_id = video.id
+            stage.status = STATUS_PENDING_RETRY
+            return True
 
         if summary:
             video.summary = summary
             stage.status = STATUS_COMPLETED
             stage.last_error = None
-            return
+            return True
 
         if stage.last_error is None:
             stage.last_error = "Summary generation failed."
@@ -558,6 +597,92 @@ class PipelineService:
             stage.status = STATUS_FAILED
         else:
             stage.status = STATUS_PENDING_RETRY
+        return True
+
+    def attempt_summary_recovery(self, session: Session, user: User) -> bool | None:
+        """Attempt at most one real pending summary while the circuit is open."""
+        if not self.summary_paused:
+            return True
+
+        row = session.execute(
+            select(PipelineStage, Video)
+            .join(Video, PipelineStage.video_id == Video.id)
+            .where(
+                PipelineStage.user_id == user.id,
+                PipelineStage.stage == STAGE_SUMMARY,
+                PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
+                Video.transcript.is_not(None),
+            )
+            .order_by(Video.published_at.asc().nullsfirst(), Video.id.asc())
+            .limit(1)
+        ).first()
+        if row is None:
+            return None
+
+        stage, video = row
+        self.summary_paused = False
+        self.summary_pause_reason = None
+        self.summary_pause_video_id = None
+        self._attempt_summary_stage(session, stage, video)
+        if stage.status != STATUS_COMPLETED:
+            self.summary_paused = True
+            self.summary_recovery_succeeded = False
+            self._persist_summary_pause_state(session, user)
+            return False
+
+        self.summary_recovery_succeeded = True
+        self._persist_summary_recovery_state(session, user)
+        return True
+
+    def _persist_summary_pause_state(self, session: Session, user: User) -> None:
+        if not self.summary_paused:
+            return
+
+        state = session.scalar(
+            select(SyncState).where(
+                SyncState.user_id == user.id,
+                SyncState.process_type == SUMMARIZATION_PROCESS,
+            )
+        )
+        if state is None:
+            state = SyncState(user_id=user.id, process_type=SUMMARIZATION_PROCESS)
+            session.add(state)
+            session.flush()
+
+        metadata = dict(state.state_metadata or {})
+        metadata["paused"] = True
+        metadata["recovery_pending_alert"] = False
+        metadata["last_error"] = self.summary_pause_reason or "Unknown summarization failure."
+        if self.summary_pause_video_id is not None:
+            metadata["failed_video_id"] = self.summary_pause_video_id
+        metadata.setdefault("alert_sent", False)
+        metadata.setdefault("incident_started_at", datetime.now(UTC).isoformat())
+        state.last_error_at = datetime.now(UTC)
+        state.last_error_message = metadata["last_error"]
+        state.state_metadata = metadata
+        session.flush()
+
+    def _persist_summary_recovery_state(self, session: Session, user: User) -> None:
+        state = session.scalar(
+            select(SyncState).where(
+                SyncState.user_id == user.id,
+                SyncState.process_type == SUMMARIZATION_PROCESS,
+            )
+        )
+        if state is None:
+            state = SyncState(user_id=user.id, process_type=SUMMARIZATION_PROCESS)
+            session.add(state)
+            session.flush()
+
+        metadata = dict(state.state_metadata or {})
+        metadata["paused"] = False
+        metadata["recovery_pending_alert"] = True
+        metadata["recovered_at"] = datetime.now(UTC).isoformat()
+        state.last_success_at = datetime.now(UTC)
+        state.last_error_at = None
+        state.last_error_message = None
+        state.state_metadata = metadata
+        session.flush()
 
     def _attempt_telegram_stage(
         self,
@@ -772,10 +897,13 @@ class PipelineService:
                 continue
 
             if stage_name == STAGE_TRANSCRIPT:
-                return FALLBACK_REASON_TRANSCRIPT.format(max_attempts=stage.max_attempts)
+                reason = FALLBACK_REASON_TRANSCRIPT.format(max_attempts=stage.max_attempts)
+                return f"{reason} Causa: {_compact_error(stage.last_error or reason)}"
             if stage_name == STAGE_SUMMARY:
-                return FALLBACK_REASON_SUMMARY.format(max_attempts=stage.max_attempts)
+                reason = FALLBACK_REASON_SUMMARY.format(max_attempts=stage.max_attempts)
+                return f"{reason} Causa: {_compact_error(stage.last_error or reason)}"
             if stage_name == STAGE_TELEGRAM:
-                return FALLBACK_REASON_TELEGRAM.format(max_attempts=stage.max_attempts)
+                reason = FALLBACK_REASON_TELEGRAM.format(max_attempts=stage.max_attempts)
+                return f"{reason} Causa: {_compact_error(stage.last_error or reason)}"
 
         return None

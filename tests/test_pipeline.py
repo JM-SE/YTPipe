@@ -28,6 +28,7 @@ from app.services.pipeline import (
 )
 from app.services.telegram import TelegramDeliveryAttemptError, TelegramDeliveryService, TelegramNotificationPayload
 from app.services.transcript import TranscriptService
+from app.services.summarization import SummarizationRequestError
 
 
 @pytest.fixture
@@ -201,6 +202,113 @@ class TestDependencyChain:
         summary_stage = [s for s in stages if s.stage == STAGE_SUMMARY][0]
         summary_stage.attempt_count = 2
         summary_stage.status = STATUS_PENDING_RETRY
+        db_session.commit()
+
+        svc.process_new_video_stages(db_session, user, channel, video)
+
+        telegram_stage = db_session.scalar(
+            select(PipelineStage).where(
+                PipelineStage.video_id == video.id,
+                PipelineStage.user_id == user.id,
+                PipelineStage.stage == STAGE_TELEGRAM,
+            )
+        )
+        assert telegram_stage.status == STATUS_SKIPPED
+
+    def test_summary_infrastructure_failure_pauses_later_summaries(
+        self, db_session, user, channel, video, transcript_service, telegram_service
+    ):
+        transcript_service.fetch_transcript.return_value = "some transcript"
+        summarization_service = MagicMock()
+        summarization_service.summarize.side_effect = SummarizationRequestError(
+            "Summarization server returned HTTP 500: Vulkan device lost."
+        )
+
+        second_video = Video(
+            youtube_video_id="video-2",
+            channel_id=channel.id,
+            title="Second Video",
+            published_at=datetime.now(UTC),
+        )
+        db_session.add(second_video)
+        db_session.commit()
+
+        svc = make_pipeline_service(
+            transcript_svc=transcript_service,
+            summarization_svc=summarization_service,
+            telegram_svc=telegram_service,
+        )
+        svc.create_stages_for_video(db_session, user.id, video.id)
+        svc.create_stages_for_video(db_session, user.id, second_video.id)
+
+        svc.process_new_video_stages(db_session, user, channel, video)
+        svc.process_new_video_stages(db_session, user, channel, second_video)
+
+        first_summary = db_session.scalar(
+            select(PipelineStage).where(
+                PipelineStage.video_id == video.id,
+                PipelineStage.user_id == user.id,
+                PipelineStage.stage == STAGE_SUMMARY,
+            )
+        )
+        second_summary = db_session.scalar(
+            select(PipelineStage).where(
+                PipelineStage.video_id == second_video.id,
+                PipelineStage.user_id == user.id,
+                PipelineStage.stage == STAGE_SUMMARY,
+            )
+        )
+        second_telegram = db_session.scalar(
+            select(PipelineStage).where(
+                PipelineStage.video_id == second_video.id,
+                PipelineStage.user_id == user.id,
+                PipelineStage.stage == STAGE_TELEGRAM,
+            )
+        )
+
+        assert svc.summary_paused is True
+        assert svc.summary_pause_reason == "Summarization server returned HTTP 500: Vulkan device lost."
+        assert first_summary.status == STATUS_PENDING_RETRY
+        assert second_summary.status == STATUS_PENDING
+        assert second_telegram.status == STATUS_PENDING
+        assert summarization_service.summarize.call_count == 1
+        assert transcript_service.fetch_transcript.call_count == 2
+
+    def test_summary_recovery_closes_circuit(self, db_session, user, channel, video, telegram_service):
+        video.transcript = "existing transcript"
+        db_session.commit()
+        summarization_service = MagicMock()
+        summarization_service.summarize.return_value = "recovered summary"
+        svc = make_pipeline_service(
+            transcript_svc=MagicMock(),
+            summarization_svc=summarization_service,
+            telegram_svc=telegram_service,
+        )
+        svc.create_stages_for_video(db_session, user.id, video.id)
+        svc.summary_paused = True
+
+        assert svc.attempt_summary_recovery(db_session, user) is True
+        assert svc.summary_paused is False
+        assert svc.summary_recovery_succeeded is True
+
+        summary_stage = db_session.scalar(
+            select(PipelineStage).where(
+                PipelineStage.video_id == video.id,
+                PipelineStage.user_id == user.id,
+                PipelineStage.stage == STAGE_SUMMARY,
+            )
+        )
+        assert summary_stage.status == STATUS_COMPLETED
+        assert video.summary == "recovered summary"
+
+    def test_telegram_skipped_when_transcript_fails(self, db_session, user, channel, video, transcript_service):
+        transcript_service.fetch_transcript.return_value = None
+        svc = make_pipeline_service(transcript_svc=transcript_service)
+
+        stages = svc.create_stages_for_video(db_session, user.id, video.id)
+        transcript_stage = [s for s in stages if s.stage == STAGE_TRANSCRIPT][0]
+        transcript_stage.attempt_count = 2
+        transcript_stage.status = STATUS_PENDING_RETRY
         db_session.commit()
 
         svc.process_new_video_stages(db_session, user, channel, video)
@@ -434,6 +542,7 @@ class TestFallbackTelegram:
         assert stats.fallbacks_sent == 1
         call = telegram_service.send_message.call_args
         assert FALLBACK_REASON_SUMMARY.format(max_attempts=3) in call[0][0]
+        assert "Causa: Summary generation failed." in call[0][0]
 
     def test_fallback_reason_telegram(self, db_session, user, channel, video,
                                         transcript_service, telegram_service):

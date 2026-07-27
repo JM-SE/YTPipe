@@ -10,6 +10,7 @@ Incident reconciliation and the single-inference execution rule are defined in `
 - [x] Content pipeline stages (transcript, summary, Telegram) each retry up to 3 total attempts.
 - [x] When a stage fails permanently after 3 attempts, a fallback Telegram message is sent with the reason.
 - [x] Fallback Telegram delivery is retried on each poll until successful.
+- [x] Summary infrastructure failures open a persisted circuit breaker without exhausting the summary stage.
 
 ## Technical Approach
 
@@ -43,6 +44,8 @@ Status transitions per stage:
 - Upstream stage fails → downstream stages → `skipped`
 - Fallback stage: created as `pending` when any stage fails, retried each poll until `completed` or non-retryable failure
 
+Summary infrastructure failures (local model HTTP errors, timeouts, transport failures, malformed responses, or empty model responses) open a persisted summarization circuit breaker. While open, summary stages remain `pending` or `pending_retry`, Telegram stages remain pending, and polling continues fetching and storing transcripts without starting new summary inferences. A later poll may perform one recovery inference; successful recovery closes the circuit and resumes the queue.
+
 **Dependency chain**: If `transcript` → `failed`, `summary` becomes `skipped`, `telegram` becomes `skipped`. If `summary` → `failed`, `telegram` becomes `skipped`. Fallback message includes the reason for the first failing stage.
 
 ### Startup Processing
@@ -75,3 +78,4 @@ On server restart, pending pipeline stages are processed with throttling:
 - [x] Fallback Telegram retries on each poll until delivered or non-retryable failure.
 - [x] Startup reprocessing uses configurable batch throttling to avoid overload.
 - [x] Downstream stages are skipped when upstream stages fail.
+- [x] A summary infrastructure failure preserves pending work and pauses later summary attempts until recovery.

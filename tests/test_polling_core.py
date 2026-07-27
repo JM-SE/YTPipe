@@ -22,7 +22,7 @@ from app.models.user import User
 from app.models.user_channel import UserChannel
 from app.models.video import Video
 from app.services.email import EmailDeliveryAttemptError
-from app.services.polling import POLLING_PROCESS, QUOTA_PROCESS, YouTubePollingService
+from app.services.polling import POLLING_PROCESS, QUOTA_PROCESS, SUMMARIZATION_PROCESS, YouTubePollingService
 from app.services.telegram import TelegramDeliveryService
 
 
@@ -1679,3 +1679,74 @@ def test_check_and_send_quota_alert_does_not_duplicate_within_24_hours(db_sessio
     polling_service._check_and_send_quota_alert(db_session, user, quota_context)
     assert len(sent_messages) == 1
     assert quota_context["quota_alerts_sent"]["thresholds"] == [50]
+
+
+def test_summary_circuit_alert_persists_and_restarts_once(db_session, monkeypatch) -> None:
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+        TELEGRAM_NOTIFICATIONS_ENABLED=True,
+        TELEGRAM_BOT_TOKEN="bot-token",
+        TELEGRAM_CHAT_ID="chat-id",
+    )
+    user = User(email="owner@example.com")
+    channel = Channel(youtube_channel_id="UC-CIRCUIT", title="Circuit Channel")
+    db_session.add_all([user, channel])
+    db_session.flush()
+    video = Video(
+        youtube_video_id="circuit-video",
+        channel_id=channel.id,
+        title="Circuit Video",
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    pipeline_service = polling_module.PipelineService()
+    pipeline_service.summary_paused = True
+    pipeline_service.summary_pause_reason = "Summarization server returned HTTP 500: Vulkan device lost."
+    pipeline_service.summary_pause_video_id = video.id
+    telegram_service = TelegramDeliveryService(settings)
+    sent_messages: list[str] = []
+    monkeypatch.setattr(telegram_service, "send_message", lambda text: sent_messages.append(text))
+    restart_service = type(
+        "FakeRecovery",
+        (),
+        {
+            "enabled": True,
+            "cooldown_seconds": 300,
+            "restart": lambda self: type("Result", (), {"succeeded": True, "reason": "restart requested"})(),
+        },
+    )()
+    polling_service = YouTubePollingService(
+        auth_service=object(),
+        email_service=object(),
+        daily_quota_budget=100,
+        safety_stop_enabled=True,
+        telegram_service=telegram_service,
+        pipeline_service=pipeline_service,
+        llama_recovery_service=restart_service,
+    )
+    summarization_state = SyncState(user_id=user.id, process_type=SUMMARIZATION_PROCESS)
+    db_session.add(summarization_state)
+    db_session.flush()
+
+    polling_service._finalize_summary_circuit(
+        db_session,
+        user,
+        summarization_state,
+        datetime.now(UTC),
+    )
+    assert len(sent_messages) == 1
+    assert "Vulkan device lost" in sent_messages[0]
+    assert summarization_state.state_metadata["paused"] is True
+    assert summarization_state.state_metadata["restart_succeeded"] is True
+
+    polling_service._finalize_summary_circuit(
+        db_session,
+        user,
+        summarization_state,
+        datetime.now(UTC),
+    )
+    assert len(sent_messages) == 1

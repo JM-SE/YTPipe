@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 
 import httpx
 
@@ -71,9 +72,11 @@ class SummarizationService:
 
         if response.status_code != 200:
             logger.warning("Summarization failed with status %d", response.status_code)
-            raise SummarizationRequestError(
-                f"Summarization server returned HTTP {response.status_code}."
-            )
+            detail = self._extract_error_detail(response)
+            message = f"Summarization server returned HTTP {response.status_code}"
+            if detail:
+                message = f"{message}: {detail}"
+            raise SummarizationRequestError(f"{message}.")
 
         try:
             data = response.json()
@@ -89,6 +92,33 @@ class SummarizationService:
         if not content.strip():
             raise SummarizationRequestError("Summarization server returned empty content.")
         return content.strip()
+
+    @staticmethod
+    def _extract_error_detail(response: httpx.Response) -> str | None:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+
+        detail: object = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                detail = error.get("message") or error.get("detail") or error.get("type")
+            elif isinstance(error, str):
+                detail = error
+            detail = detail or payload.get("message") or payload.get("detail")
+
+        if detail is None:
+            text = response.text.strip()
+            detail = text or None
+        if detail is None:
+            return None
+
+        if not isinstance(detail, str):
+            detail = json.dumps(detail, ensure_ascii=True)
+        detail = " ".join(detail.replace("\n", " ").replace("\r", " ").split())
+        return detail[:400] or None
 
     @staticmethod
     def _split_transcript(transcript: str) -> list[str]:

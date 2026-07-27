@@ -1,0 +1,2 @@
+Cmnd_Alias YTPIPE_LLAMA_RESTART = /usr/bin/systemctl restart llama-server.service
+jmse ALL=(root) NOPASSWD: YTPIPE_LLAMA_RESTART

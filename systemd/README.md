@@ -8,6 +8,7 @@ These units are intentionally not installed automatically. Installing or replaci
 4. The monitor reads `/home/jmse/labs/YTPipe/.env`; do not copy bearer or Telegram secrets into unit files.
 5. The monitor keeps its local failure-alert state in `/home/jmse/.local/state/ytpipe-poll-monitor` so it works both under systemd and in manual validation.
 6. Set `POLL_INTERVAL_MINUTES` in `.env` to a positive whole number. The default and current local value is `60`; restart the service after changing it.
+7. Set `LLAMA_CPP_AUTO_RESTART_ENABLED=true` only after installing and validating the narrow sudoers rule below.
 
 ## Operator Commands
 
@@ -17,6 +18,18 @@ After validating the current manual llama.cpp process, restore systemd ownership
 sudo systemctl restart llama-server.service
 sudo systemctl status llama-server.service --no-pager
 ```
+
+Install the optional automatic recovery permission. It allows only the exact llama.cpp restart command:
+
+```bash
+sudo install -o root -g root -m 0440 \
+  systemd/ytpipe-llama-restart.sudoers \
+  /etc/sudoers.d/ytpipe-llama-restart
+sudo visudo -cf /etc/sudoers.d/ytpipe-llama-restart
+sudo -u jmse sudo -n /usr/bin/systemctl restart llama-server.service
+```
+
+Then enable recovery in `.env` with `LLAMA_CPP_AUTO_RESTART_ENABLED=true`. The default cooldown is 300 seconds and can be changed with `LLAMA_CPP_RESTART_COOLDOWN_SECONDS`. Restart `ytpipe-api.service` after changing these settings.
 
 The selected AMD GPU PPT cap is 100 W. The kernel exposes the current cap at
 `/sys/class/drm/card0/device/hwmon/hwmon0/power1_cap` in microwatts and requires root:

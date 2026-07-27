@@ -18,6 +18,7 @@ from app.models.sync_state import SyncState
 from app.models.user import User
 from app.services.auth import GOOGLE_PROVIDER, GoogleOAuthService
 from app.services.email import EmailDeliveryService
+from app.services.llama_recovery import LlamaRecoveryService
 from app.services.mobile_push import MobilePushService
 from app.services.pipeline import PipelineService
 from app.services.polling import POLLING_PROCESS, YouTubePollingService
@@ -231,6 +232,10 @@ def _build_polling_service(settings: Settings) -> YouTubePollingService:
             startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
         ),
         pipeline_drain_pause_seconds=settings.pipeline_drain_pause_seconds,
+        llama_recovery_service=LlamaRecoveryService(
+            enabled=settings.llama_cpp_auto_restart_enabled,
+            cooldown_seconds=settings.llama_cpp_restart_cooldown_seconds,
+        ),
     )
 
 
