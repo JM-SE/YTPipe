@@ -50,6 +50,7 @@ Environment variable contract:
 | `GOOGLE_REDIRECT_URI` | OAuth callback URL; on Render use `https://<render-service-host>/auth/callback`. |
 | `POLL_QUOTA_DAILY_BUDGET` | Daily YouTube quota budget used by the polling safety guard. |
 | `POLL_QUOTA_SAFETY_STOP_ENABLED` | Enables/disables quota safety stop. |
+| `SHORTS_PROCESSING_ENABLED` | Globally enables or disables downstream processing and notifications for detected Shorts. |
 | `EMAIL_DELIVERY_MODE` | `fake` for staging/test; `resend` for production final. |
 | `RESEND_API_KEY` | Required only for real Resend delivery. |
 | `RESEND_FROM_EMAIL` | Required only for real Resend delivery. |

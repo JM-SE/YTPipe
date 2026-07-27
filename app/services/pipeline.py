@@ -33,6 +33,7 @@ STATUS_PENDING_RETRY = "pending_retry"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
+SHORT_PROCESSING_DISABLED_ERROR = "Short processing is disabled by configuration."
 
 FALLBACK_MESSAGE_TEMPLATE = (
     "⚠️ No se pudo completar el envío\n"
@@ -82,6 +83,7 @@ class PipelineService:
         startup_batch_size: int = 0,
         startup_batch_delay_seconds: float = 30.0,
         summary_paused: bool = False,
+        shorts_processing_enabled: bool = True,
     ):
         self.transcript_service = transcript_service
         self.summarization_service = summarization_service
@@ -89,11 +91,21 @@ class PipelineService:
         self.startup_batch_size = max(0, startup_batch_size)
         self.startup_batch_delay_seconds = max(0, startup_batch_delay_seconds)
         self.summary_paused = summary_paused
+        self.shorts_processing_enabled = shorts_processing_enabled
         self.summary_pause_reason: str | None = None
         self.summary_pause_video_id: int | None = None
         self.summary_recovery_succeeded = False
 
     def create_stages_for_video(self, session: Session, user_id: int, video_id: int) -> list[PipelineStage]:
+        video = session.get(Video, video_id)
+        if video is not None and not self._should_process_video(video):
+            return session.scalars(
+                select(PipelineStage).where(
+                    PipelineStage.video_id == video_id,
+                    PipelineStage.user_id == user_id,
+                )
+            ).all()
+
         stages = []
         for stage_name in (STAGE_TRANSCRIPT, STAGE_SUMMARY, STAGE_TELEGRAM):
             existing = session.scalar(
@@ -126,6 +138,9 @@ class PipelineService:
         channel: Channel,
         video: Video,
     ) -> PipelineProcessingStats:
+        if not self._should_process_video(video):
+            return self._skip_disabled_short_stages(session, user.id, video.id)
+
         stages_processed = 0
         stages_succeeded = 0
         stages_failed = 0
@@ -193,11 +208,17 @@ class PipelineService:
             summary_attempted=summary_attempted,
         )
 
+    def skip_disabled_short_work(self, session: Session, user: User) -> None:
+        """Terminally skip queued Short stages before any recovery or drain work."""
+        self._skip_disabled_short_stages_for_user(session, user.id)
+
     def process_pending_stages(
         self,
         session: Session,
         user: User,
     ) -> PipelineProcessingStats:
+        self._skip_disabled_short_stages_for_user(session, user.id)
+
         stages_processed = 0
         stages_succeeded = 0
         stages_failed = 0
@@ -333,6 +354,7 @@ class PipelineService:
         user: User,
     ) -> PipelineProcessingStats:
         """Advance one recoverable video at a time during normal polling."""
+        self._skip_disabled_short_stages_for_user(session, user.id)
         row = session.execute(
             select(Video, Channel)
             .join(PipelineStage, PipelineStage.video_id == Video.id)
@@ -358,6 +380,7 @@ class PipelineService:
         sleep: Callable[[float], None] = time.sleep,
     ) -> PipelineDrainStats:
         """Process queued videos oldest-first, committing each before the next pause."""
+        self._skip_disabled_short_stages_for_user(session, user.id)
         total = PipelineProcessingStats(0, 0, 0, 0, 0)
         videos_processed = 0
         pause_seconds = max(0.0, pause_seconds)
@@ -604,7 +627,7 @@ class PipelineService:
         if not self.summary_paused:
             return True
 
-        row = session.execute(
+        recovery_query = (
             select(PipelineStage, Video)
             .join(Video, PipelineStage.video_id == Video.id)
             .where(
@@ -613,8 +636,11 @@ class PipelineService:
                 PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
                 Video.transcript.is_not(None),
             )
-            .order_by(Video.published_at.asc().nullsfirst(), Video.id.asc())
-            .limit(1)
+        )
+        if not self.shorts_processing_enabled:
+            recovery_query = recovery_query.where(Video.is_short.is_not(True))
+        row = session.execute(
+            recovery_query.order_by(Video.published_at.asc().nullsfirst(), Video.id.asc()).limit(1)
         ).first()
         if row is None:
             return None
@@ -875,6 +901,49 @@ class PipelineService:
             return
         stage.status = STATUS_SKIPPED
         stage.last_error = None
+
+    def _should_process_video(self, video: Video) -> bool:
+        return self.shorts_processing_enabled or video.is_short is not True
+
+    def _skip_disabled_short_stages_for_user(self, session: Session, user_id: int) -> None:
+        if self.shorts_processing_enabled:
+            return
+
+        rows = session.execute(
+            select(PipelineStage, Video)
+            .join(Video, PipelineStage.video_id == Video.id)
+            .where(
+                PipelineStage.user_id == user_id,
+                PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
+                Video.is_short.is_(True),
+            )
+        ).all()
+        for stage, _video in rows:
+            self._skip_stage(session, stage)
+            stage.last_error = SHORT_PROCESSING_DISABLED_ERROR
+        session.flush()
+
+    def _skip_disabled_short_stages(
+        self,
+        session: Session,
+        user_id: int,
+        video_id: int,
+    ) -> PipelineProcessingStats:
+        if self.shorts_processing_enabled:
+            return PipelineProcessingStats(0, 0, 0, 0, 0)
+
+        stages = session.scalars(
+            select(PipelineStage).where(
+                PipelineStage.user_id == user_id,
+                PipelineStage.video_id == video_id,
+                PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
+            )
+        ).all()
+        for stage in stages:
+            self._skip_stage(session, stage)
+            stage.last_error = SHORT_PROCESSING_DISABLED_ERROR
+        session.flush()
+        return PipelineProcessingStats(0, 0, 0, len(stages), 0)
 
     def _should_trigger_fallback(self, stage_map: dict[str, PipelineStage]) -> bool:
         for stage_name in (STAGE_TRANSCRIPT, STAGE_SUMMARY, STAGE_TELEGRAM):

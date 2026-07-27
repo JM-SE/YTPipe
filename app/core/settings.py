@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     poll_interval_minutes: int = Field(default=60, ge=1, alias="POLL_INTERVAL_MINUTES")
     poll_quota_daily_budget: int = Field(default=500, alias="POLL_QUOTA_DAILY_BUDGET")
     poll_quota_safety_stop_enabled: bool = Field(default=True, alias="POLL_QUOTA_SAFETY_STOP_ENABLED")
+    shorts_processing_enabled: bool = Field(default=True, alias="SHORTS_PROCESSING_ENABLED")
     push_notifications_enabled: bool = Field(default=False, alias="PUSH_NOTIFICATIONS_ENABLED")
     expo_push_endpoint: str = Field(
         default="https://exp.host/--/api/v2/push/send",

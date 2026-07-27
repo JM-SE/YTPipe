@@ -164,6 +164,7 @@ def _process_pending_pipeline_startup(settings: Settings) -> None:
             startup_batch_size=settings.pipeline_startup_batch_size,
             startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
             summary_paused=summary_paused,
+            shorts_processing_enabled=settings.shorts_processing_enabled,
         )
 
         stats = pipeline_service.process_next_pending_video(session=session, user=user)

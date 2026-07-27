@@ -17,6 +17,7 @@ from app.main import app
 from app.models.channel import Channel
 from app.models.notification_delivery import NotificationDelivery
 from app.models.oauth_account import OAuthAccount
+from app.models.pipeline_stage import PipelineStage
 from app.models.sync_state import SyncState
 from app.models.user import User
 from app.models.user_channel import UserChannel
@@ -1535,6 +1536,88 @@ def test_run_poll_detects_short_by_video_duration(db_session, monkeypatch) -> No
     video = db_session.query(Video).one()
     assert video.youtube_video_id == "video-short"
     assert video.is_short is True
+
+
+def test_run_poll_skips_disabled_short_processing(db_session, monkeypatch) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        POLL_QUOTA_DAILY_BUDGET=50,
+        POLL_QUOTA_SAFETY_STOP_ENABLED=True,
+        SHORTS_PROCESSING_ENABLED=False,
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+    )
+
+    user = User(email="owner@example.com")
+    channel = Channel(youtube_channel_id="channel-a", title="A", uploads_playlist_id="uploads-a")
+    db_session.add_all([user, channel])
+    db_session.flush()
+    user_channel = UserChannel(
+        user_id=user.id,
+        channel_id=channel.id,
+        is_monitored=True,
+        last_seen_video_id="video-old",
+        baseline_established_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    db_session.add(user_channel)
+    db_session.add(
+        OAuthAccount(
+            user_id=user.id,
+            provider="google",
+            access_token="token",
+            refresh_token="refresh",
+            token_expiry=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        polling_module.GoogleOAuthService,
+        "ensure_valid_credentials",
+        lambda self, session, oauth_account: object(),  # noqa: ARG005
+    )
+
+    class FakeRequest:
+        def execute(self):
+            return {
+                "items": [
+                    {
+                        "snippet": {"title": "Ignored Short #shorts", "publishedAt": "2026-04-25T12:00:00Z"},
+                        "contentDetails": {"videoId": "video-short"},
+                    }
+                ]
+            }
+
+    class FakePlaylistItemsResource:
+        def list(self, **kwargs):  # noqa: ARG002
+            return FakeRequest()
+
+    class FakeYouTube:
+        def playlistItems(self):
+            return FakePlaylistItemsResource()
+
+    monkeypatch.setattr(polling_module, "build", lambda *args, **kwargs: FakeYouTube())
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.post(
+            "/internal/run-poll",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    video = db_session.query(Video).one()
+    assert video.is_short is True
+    assert db_session.query(NotificationDelivery).count() == 0
+    assert db_session.query(PipelineStage).count() == 0
+    assert user_channel.last_seen_video_id == "video-short"
 
 
 def test_run_poll_quota_alert_sent_at_threshold(db_session, monkeypatch) -> None:

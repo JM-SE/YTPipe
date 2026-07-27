@@ -220,6 +220,7 @@ def _build_polling_service(settings: Settings) -> YouTubePollingService:
         email_service=EmailDeliveryService(settings),
         daily_quota_budget=settings.poll_quota_daily_budget,
         safety_stop_enabled=settings.poll_quota_safety_stop_enabled,
+        shorts_processing_enabled=settings.shorts_processing_enabled,
         mobile_push_service=MobilePushService(settings),
         telegram_service=TelegramDeliveryService(settings),
         transcript_service=TranscriptService(settings),
@@ -230,6 +231,7 @@ def _build_polling_service(settings: Settings) -> YouTubePollingService:
             telegram_service=TelegramDeliveryService(settings),
             startup_batch_size=settings.pipeline_startup_batch_size,
             startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
+            shorts_processing_enabled=settings.shorts_processing_enabled,
         ),
         pipeline_drain_pause_seconds=settings.pipeline_drain_pause_seconds,
         llama_recovery_service=LlamaRecoveryService(

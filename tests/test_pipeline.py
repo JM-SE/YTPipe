@@ -75,11 +75,18 @@ def telegram_service() -> MagicMock:
     return MagicMock(spec=TelegramDeliveryService)
 
 
-def make_pipeline_service(transcript_svc=None, summarization_svc=None, telegram_svc=None):
+def make_pipeline_service(
+    transcript_svc=None,
+    summarization_svc=None,
+    telegram_svc=None,
+    *,
+    shorts_processing_enabled=True,
+):
     return PipelineService(
         transcript_service=transcript_svc,
         summarization_service=summarization_svc,
         telegram_service=telegram_svc,
+        shorts_processing_enabled=shorts_processing_enabled,
     )
 
 
@@ -108,6 +115,62 @@ class TestPipelineStageCreation:
         assert len(second) == 3
         assert second[0].id == one.id
         assert second[0].status == STATUS_COMPLETED
+
+    def test_disabled_shorts_do_not_create_pipeline_stages(self, db_session, user, video):
+        video.is_short = True
+        db_session.commit()
+
+        svc = make_pipeline_service(shorts_processing_enabled=False)
+
+        assert svc.create_stages_for_video(db_session, user.id, video.id) == []
+
+
+class TestDisabledShortProcessing:
+    def test_pending_short_stages_are_skipped_without_transcript_call(
+        self,
+        db_session,
+        user,
+        video,
+        transcript_service,
+    ):
+        video.is_short = True
+        db_session.commit()
+        PipelineService().create_stages_for_video(db_session, user.id, video.id)
+
+        svc = make_pipeline_service(
+            transcript_svc=transcript_service,
+            shorts_processing_enabled=False,
+        )
+
+        stats = svc.process_pending_stages(db_session, user)
+
+        assert stats.stages_processed == 0
+        assert stats.stages_skipped == 0
+        transcript_service.fetch_transcript.assert_not_called()
+        stages = db_session.scalars(select(PipelineStage)).all()
+        assert stages
+        assert {stage.status for stage in stages} == {STATUS_SKIPPED}
+
+    def test_summary_recovery_skips_short_before_inference(self, db_session, user, video):
+        video.is_short = True
+        video.transcript = "existing transcript"
+        db_session.commit()
+        PipelineService().create_stages_for_video(db_session, user.id, video.id)
+
+        summary_service = MagicMock()
+        svc = make_pipeline_service(
+            summarization_svc=summary_service,
+            shorts_processing_enabled=False,
+        )
+        svc.summary_paused = True
+
+        svc.skip_disabled_short_work(db_session, user)
+        result = svc.attempt_summary_recovery(db_session, user)
+
+        assert result is None
+        summary_service.summarize.assert_not_called()
+        stages = db_session.scalars(select(PipelineStage)).all()
+        assert {stage.status for stage in stages} == {STATUS_SKIPPED}
 
 
 class TestTranscriptStage:

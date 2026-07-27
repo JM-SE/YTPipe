@@ -329,6 +329,8 @@ class MobilePushService:
         """Best-effort new-video push fan-out for the polling new-video branch."""
         if not self.settings.push_notifications_enabled:
             return []
+        if video.is_short is True and not self.settings.shorts_processing_enabled:
+            return []
 
         try:
             push_settings = self.get_or_create_global_settings(session, user.id)

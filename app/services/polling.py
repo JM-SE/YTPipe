@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.channel import Channel
+from app.models.mobile_push_delivery import MobilePushDelivery
 from app.models.notification_delivery import NotificationDelivery
 from app.models.oauth_account import OAuthAccount
 from app.models.sync_state import SyncState
@@ -25,7 +26,11 @@ from app.models.user_channel import UserChannel
 from app.models.video import Video
 from app.services.auth import GoogleOAuthService
 from app.services.email import EmailDeliveryAttemptError, EmailDeliveryService, EmailNotificationPayload
-from app.services.mobile_push import MobilePushService
+from app.services.mobile_push import (
+    PUSH_DELIVERY_PENDING,
+    PUSH_DELIVERY_SKIPPED,
+    MobilePushService,
+)
 from app.services.llama_recovery import LlamaRecoveryService
 from app.services.pipeline import SUMMARIZATION_PROCESS, PipelineDrainStats, PipelineService
 from app.services.summarization import SummarizationService
@@ -40,6 +45,8 @@ DEFAULT_DELIVERY_STATUS = "pending"
 DELIVERY_PENDING_RETRY_STATUS = "pending_retry"
 DELIVERY_DELIVERED_STATUS = "delivered"
 DELIVERY_FAILED_STATUS = "failed"
+DELIVERY_SKIPPED_STATUS = "skipped"
+SHORT_PROCESSING_DISABLED_ERROR = "Short processing is disabled by configuration."
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +91,7 @@ class YouTubePollingService:
         email_service: EmailDeliveryService,
         daily_quota_budget: int,
         safety_stop_enabled: bool,
+        shorts_processing_enabled: bool = True,
         mobile_push_service: MobilePushService | None = None,
         telegram_service: TelegramDeliveryService | None = None,
         transcript_service: TranscriptService | None = None,
@@ -96,6 +104,7 @@ class YouTubePollingService:
         self.email_service = email_service
         self.daily_quota_budget = max(0, daily_quota_budget)
         self.safety_stop_enabled = safety_stop_enabled
+        self.shorts_processing_enabled = shorts_processing_enabled
         self.mobile_push_service = mobile_push_service
         self.telegram_service = telegram_service
         self.transcript_service = transcript_service
@@ -111,6 +120,7 @@ class YouTubePollingService:
         summarization_state = self._get_or_create_sync_state(session, user.id, SUMMARIZATION_PROCESS)
         self._load_summary_circuit_state(self.pipeline_service, summarization_state)
         self._deliver_pending_summary_recovery_alert(summarization_state)
+        self._skip_disabled_short_work(session, user)
 
         quota_context = self._build_quota_context(quota_state, now)
         if quota_context["quota_blocked"]:
@@ -169,6 +179,11 @@ class YouTubePollingService:
 
                 video = self._get_or_create_video(session, channel.id, latest_upload)
                 self._attempt_detect_and_mark_short(session, youtube, video, quota_context)
+                if not self._should_process_video(video):
+                    user_channel.last_seen_video_id = latest_upload.video_id
+                    new_videos_detected += 1
+                    channels_processed += 1
+                    continue
                 if self.pipeline_service is not None:
                     self.pipeline_service.create_stages_for_video(session, user.id, video.id)
                 delivery = self._get_or_create_delivery(session, user.id, video.id)
@@ -251,6 +266,7 @@ class YouTubePollingService:
         self._load_summary_circuit_state(self.pipeline_service, summarization_state)
         self._deliver_pending_summary_recovery_alert(summarization_state)
         quota_context = self._build_quota_context(quota_state, now)
+        self._skip_disabled_short_work(session, user)
         credentials = self.auth_service.ensure_valid_credentials(session, oauth_account)
         youtube = build("youtube", "v3", credentials=credentials, cache_discovery=False)
         monitored_rows = session.execute(
@@ -295,7 +311,7 @@ class YouTubePollingService:
                 for upload in reversed(uploads):
                     video = self._get_or_create_video(session, channel.id, upload)
                     self._attempt_detect_and_mark_short(session, youtube, video, quota_context)
-                    if self.pipeline_service is not None:
+                    if self.pipeline_service is not None and self._should_process_video(video):
                         self.pipeline_service.create_stages_for_video(session, user.id, video.id)
 
                 if uploads:
@@ -696,6 +712,51 @@ class YouTubePollingService:
                 is_retry=False,
             )
 
+    def _skip_disabled_short_deliveries(self, session: Session, user: User) -> None:
+        if self.shorts_processing_enabled:
+            return
+
+        pending_rows = session.execute(
+            select(NotificationDelivery, Video)
+            .join(Video, NotificationDelivery.video_id == Video.id)
+            .where(
+                NotificationDelivery.user_id == user.id,
+                NotificationDelivery.status.in_([
+                    DEFAULT_DELIVERY_STATUS,
+                    DELIVERY_PENDING_RETRY_STATUS,
+                ]),
+                Video.is_short.is_(True),
+            )
+        ).all()
+
+        for delivery, _video in pending_rows:
+            delivery.status = DELIVERY_SKIPPED_STATUS
+            delivery.last_error = SHORT_PROCESSING_DISABLED_ERROR
+
+    def _skip_disabled_short_push_deliveries(self, session: Session, user: User) -> None:
+        if self.shorts_processing_enabled:
+            return
+
+        pending_rows = session.execute(
+            select(MobilePushDelivery, Video)
+            .join(Video, MobilePushDelivery.video_id == Video.id)
+            .where(
+                MobilePushDelivery.user_id == user.id,
+                MobilePushDelivery.status == PUSH_DELIVERY_PENDING,
+                Video.is_short.is_(True),
+            )
+        ).all()
+
+        for delivery, _video in pending_rows:
+            delivery.status = PUSH_DELIVERY_SKIPPED
+            delivery.last_error = SHORT_PROCESSING_DISABLED_ERROR
+
+    def _skip_disabled_short_work(self, session: Session, user: User) -> None:
+        if self.pipeline_service is not None:
+            self.pipeline_service.skip_disabled_short_work(session, user)
+        self._skip_disabled_short_deliveries(session, user)
+        self._skip_disabled_short_push_deliveries(session, user)
+
     def _attempt_initial_delivery_send(
         self,
         delivery: NotificationDelivery,
@@ -794,6 +855,9 @@ class YouTubePollingService:
         delivery.last_attempt_at = attempted_at
         delivery.last_error = None
         delivery.status = DELIVERY_DELIVERED_STATUS
+
+    def _should_process_video(self, video: Video) -> bool:
+        return self.shorts_processing_enabled or video.is_short is not True
 
     def _build_quota_context(self, quota_state: SyncState, now: datetime) -> dict[str, Any]:
         existing = quota_state.state_metadata or {}
