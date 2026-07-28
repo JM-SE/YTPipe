@@ -21,11 +21,13 @@ from app.api.routes.mobile_push import router as mobile_push_router
 from app.api.routes.polling import router as polling_router
 from app.api.routes.status import router as status_router
 from app.api.routes.subscriptions import router as subscriptions_router
+from app.api.routes.telegram_commands import router as telegram_commands_router
 from app.core.settings import Settings, get_settings
 from app.db.session import SessionLocal
 from app.models.sync_state import SyncState
 from app.models.user import User
 from app.services.pipeline import PipelineService
+from app.services.execution_lock import ExecutionLockBusy, acquire_execution_lock
 from app.services.polling import SUMMARIZATION_PROCESS
 from app.services.summarization import SummarizationService
 from app.services.telegram import TelegramDeliveryService
@@ -72,6 +74,7 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
     app.include_router(polling_router)
     app.include_router(status_router)
     app.include_router(subscriptions_router)
+    app.include_router(telegram_commands_router)
 
     def require_docs_access(authorization: str | None = Header(default=None)) -> None:
         if settings.app_env.strip().lower() == "local":
@@ -157,18 +160,23 @@ def _process_pending_pipeline_startup(settings: Settings) -> None:
             and (summarization_state.state_metadata or {}).get("paused", False)
         )
 
-        pipeline_service = PipelineService(
-            transcript_service=TranscriptService(settings),
-            summarization_service=SummarizationService(settings),
-            telegram_service=TelegramDeliveryService(settings),
-            startup_batch_size=settings.pipeline_startup_batch_size,
-            startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
-            summary_paused=summary_paused,
-            shorts_processing_enabled=settings.shorts_processing_enabled,
-        )
+        try:
+            with acquire_execution_lock(session):
+                pipeline_service = PipelineService(
+                    transcript_service=TranscriptService(settings),
+                    summarization_service=SummarizationService(settings),
+                    telegram_service=TelegramDeliveryService(settings),
+                    startup_batch_size=settings.pipeline_startup_batch_size,
+                    startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
+                    summary_paused=summary_paused,
+                    shorts_processing_enabled=settings.shorts_processing_enabled,
+                )
 
-        stats = pipeline_service.process_next_pending_video(session=session, user=user)
-        session.commit()
+                stats = pipeline_service.process_next_pending_video(session=session, user=user)
+                session.commit()
+        except ExecutionLockBusy:
+            logger.info("Startup pipeline processing skipped: shared execution lock is busy.")
+            return
 
         logger.info(
             "Startup pipeline processing complete: "

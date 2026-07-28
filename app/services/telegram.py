@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
@@ -17,10 +18,16 @@ class TelegramNotificationPayload:
 
 
 class TelegramDeliveryAttemptError(Exception):
-    def __init__(self, message: str, retryable: bool):
+    def __init__(self, message: str, retryable: bool, *, retry_after_seconds: int | None = None):
         super().__init__(message)
         self.message = message
         self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+
+
+@dataclass(frozen=True)
+class TelegramDeliveryResult:
+    provider_message_id: int | None = None
 
 
 class TelegramDeliveryService:
@@ -63,6 +70,7 @@ class TelegramDeliveryService:
             raise TelegramDeliveryAttemptError("Telegram delivery network error.", retryable=True) from exc
 
         if 200 <= response.status_code < 300:
+            self._extract_success_message_id(response)
             return
 
         error_message = self._extract_error_message(response)
@@ -73,13 +81,37 @@ class TelegramDeliveryService:
         if not self.enabled:
             return
 
+        self.send_message_to_chat(text, chat_id=self.chat_id)
+
+    def send_message_to_chat(
+        self,
+        text: str,
+        *,
+        chat_id: int | str,
+        reply_to_message_id: int | None = None,
+    ) -> TelegramDeliveryResult:
+        if not self.enabled:
+            return TelegramDeliveryResult()
+        if str(chat_id) != self.chat_id:
+            raise TelegramDeliveryAttemptError(
+                "Telegram reply destination is not authorized.",
+                retryable=False,
+            )
+
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+        }
+        if reply_to_message_id is not None:
+            payload["reply_parameters"] = {
+                "message_id": reply_to_message_id,
+                "allow_sending_without_reply": True,
+            }
+
         try:
             response = httpx.post(
                 f"https://api.telegram.org/bot{self.bot_token}/sendMessage",
-                json={
-                    "chat_id": self.chat_id,
-                    "text": text,
-                },
+                json=payload,
                 timeout=10.0,
             )
         except httpx.TimeoutException as exc:
@@ -88,11 +120,15 @@ class TelegramDeliveryService:
             raise TelegramDeliveryAttemptError("Telegram delivery network error.", retryable=True) from exc
 
         if 200 <= response.status_code < 300:
-            return
+            return TelegramDeliveryResult(provider_message_id=self._extract_success_message_id(response))
 
         error_message = self._extract_error_message(response)
         retryable = self._is_retryable_status(response.status_code)
-        raise TelegramDeliveryAttemptError(error_message, retryable=retryable)
+        raise TelegramDeliveryAttemptError(
+            error_message,
+            retryable=retryable,
+            retry_after_seconds=self._extract_retry_after(response),
+        )
 
     def _validate_configuration(self) -> None:
         if not self.enabled:
@@ -109,19 +145,34 @@ class TelegramDeliveryService:
 
     @staticmethod
     def _extract_error_message(response: httpx.Response) -> str:
-        detail: str | None = None
+        return f"Telegram API request failed ({response.status_code})."
+
+    @staticmethod
+    def _extract_retry_after(response: httpx.Response) -> int | None:
         try:
             payload = response.json()
         except ValueError:
-            payload = {}
+            return None
+        parameters = payload.get("parameters") if isinstance(payload, dict) else None
+        retry_after = parameters.get("retry_after") if isinstance(parameters, dict) else None
+        if not isinstance(retry_after, int):
+            return None
+        return min(max(retry_after, 1), 300)
 
-        if isinstance(payload, dict):
-            value = payload.get("description")
-            if isinstance(value, str) and value:
-                detail = value
-
-        if detail is None:
-            text = response.text.strip()
-            detail = text or "Telegram API rejected send request."
-
-        return f"Telegram API request failed ({response.status_code}): {detail}"
+    @staticmethod
+    def _extract_success_message_id(response: httpx.Response) -> int:
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise TelegramDeliveryAttemptError(
+                "Telegram returned an invalid success response.",
+                retryable=True,
+            ) from exc
+        result = body.get("result") if isinstance(body, dict) and body.get("ok") is True else None
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        if not isinstance(message_id, int):
+            raise TelegramDeliveryAttemptError(
+                "Telegram returned an invalid success response.",
+                retryable=True,
+            )
+        return message_id

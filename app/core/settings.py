@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     telegram_notifications_enabled: bool = Field(default=False, alias="TELEGRAM_NOTIFICATIONS_ENABLED")
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
+    telegram_commands_enabled: bool = Field(default=False, alias="TELEGRAM_COMMANDS_ENABLED")
+    telegram_allowed_user_id: str = Field(default="", alias="TELEGRAM_ALLOWED_USER_ID")
+    telegram_bot_username: str = Field(default="", alias="TELEGRAM_BOT_USERNAME")
     pipeline_startup_batch_size: int = Field(default=5, alias="PIPELINE_STARTUP_BATCH_SIZE")
     pipeline_startup_batch_delay_seconds: float = Field(default=30.0, alias="PIPELINE_STARTUP_BATCH_DELAY_SECONDS")
     pipeline_drain_pause_seconds: float = Field(default=60.0, alias="PIPELINE_DRAIN_PAUSE_SECONDS")
@@ -63,6 +66,10 @@ class Settings(BaseSettings):
     google_client_id: str = Field(default="", alias="GOOGLE_CLIENT_ID")
     google_client_secret: str = Field(default="", alias="GOOGLE_CLIENT_SECRET")
     google_redirect_uri: str = Field(default="http://127.0.0.1:8000/auth/callback", alias="GOOGLE_REDIRECT_URI")
+
+    @property
+    def normalized_telegram_bot_username(self) -> str:
+        return self.telegram_bot_username.strip().lstrip("@").lower()
 
     @property
     def google_oauth_scopes(self) -> tuple[str, ...]:
@@ -89,10 +96,13 @@ class Settings(BaseSettings):
                 "Unsafe runtime configuration: "
                 f"APP_ENV must be one of {sorted(allowed_envs)}, got `{self.app_env}`."
             )
+        errors: list[str] = []
+        self._validate_telegram_commands(errors)
         if app_env == "local":
+            if errors:
+                raise RuntimeError(f"Unsafe runtime configuration: {'; '.join(errors)}")
             return
 
-        errors: list[str] = []
         self._require_non_placeholder("APP_SECRET_KEY", self.app_secret_key, "replace-me", errors)
         self._require_non_placeholder(
             "INTERNAL_API_BEARER_TOKEN",
@@ -142,6 +152,42 @@ class Settings(BaseSettings):
             errors.append(f"{name} is required.")
         elif placeholder and normalized == placeholder:
             errors.append(f"{name} must not use placeholder value `{placeholder}`.")
+
+    def _validate_telegram_commands(self, errors: list[str]) -> None:
+        if not self.telegram_commands_enabled:
+            return
+
+        if not self.telegram_notifications_enabled:
+            errors.append("TELEGRAM_NOTIFICATIONS_ENABLED must be true when TELEGRAM_COMMANDS_ENABLED=true.")
+        self._require_non_placeholder("TELEGRAM_BOT_TOKEN", self.telegram_bot_token, "", errors)
+        self._require_numeric_identifier("TELEGRAM_CHAT_ID", self.telegram_chat_id, allow_negative=True, errors=errors)
+        self._require_numeric_identifier(
+            "TELEGRAM_ALLOWED_USER_ID",
+            self.telegram_allowed_user_id,
+            allow_negative=False,
+            errors=errors,
+        )
+        if not self.normalized_telegram_bot_username:
+            errors.append("TELEGRAM_BOT_USERNAME is required when TELEGRAM_COMMANDS_ENABLED=true.")
+        self._require_non_placeholder(
+            "INTERNAL_API_BEARER_TOKEN",
+            self.internal_api_bearer_token,
+            "replace-me-internal",
+            errors,
+        )
+
+    @staticmethod
+    def _require_numeric_identifier(
+        name: str,
+        value: str,
+        *,
+        allow_negative: bool,
+        errors: list[str],
+    ) -> None:
+        normalized = value.strip()
+        digits = normalized[1:] if allow_negative and normalized.startswith("-") else normalized
+        if not digits.isdigit() or (allow_negative and normalized == "-"):
+            errors.append(f"{name} must be a decimal Telegram identifier.")
 
 
 @lru_cache

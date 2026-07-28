@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-import threading
 from collections.abc import Generator
 from urllib.parse import urlparse
 
@@ -18,6 +17,7 @@ from app.models.sync_state import SyncState
 from app.models.user import User
 from app.services.auth import GOOGLE_PROVIDER, GoogleOAuthService
 from app.services.email import EmailDeliveryService
+from app.services.execution_lock import ExecutionLockBusy, acquire_execution_lock
 from app.services.llama_recovery import LlamaRecoveryService
 from app.services.mobile_push import MobilePushService
 from app.services.pipeline import PipelineService
@@ -33,7 +33,6 @@ GOOGLE_REAUTH_REQUIRED_DETAILS = {
     "Stored Google credentials are not valid. Manual re-auth is required.",
 }
 GOOGLE_REAUTH_ALERT_INTERVAL = timedelta(hours=24)
-_POLL_EXECUTION_LOCK = threading.Lock()
 
 
 class PollRunResponse(BaseModel):
@@ -61,16 +60,21 @@ class ReconciliationRequest(BaseModel):
     process_recovered: bool = False
 
 
-def require_poll_execution_lock() -> Generator[None, None, None]:
-    if not _POLL_EXECUTION_LOCK.acquire(blocking=False):
+def require_poll_execution_lock(
+    session: Session = Depends(get_db_session),
+) -> Generator[None, None, None]:
+    try:
+        lock = acquire_execution_lock(session)
+        lock.__enter__()
+    except ExecutionLockBusy as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Another polling or reconciliation run is already active.",
-        )
+        ) from exc
     try:
         yield
     finally:
-        _POLL_EXECUTION_LOCK.release()
+        lock.__exit__(None, None, None)
 
 
 @router.post(

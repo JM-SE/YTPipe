@@ -38,6 +38,11 @@ include = ["app*"]
     "alembic/versions/20260423_0003_user_channel_import_contract.py",
     "alembic/versions/20260424_0004_mobile_push_schema_settings_service.py",
     "alembic/versions/20260708_0005_add_transcript_to_videos.py",
+    "alembic/versions/20260708_0006_add_summary_to_videos.py",
+    "alembic/versions/20260710_0007_add_pipeline_stages.py",
+    "alembic/versions/20260713_0008_add_is_short_to_videos.py",
+    "alembic/versions/20260728_0009_add_telegram_command_requests.py",
+    "alembic/versions/20260728_0010_expand_telegram_command_url.py",
 ]
 
 [tool.pytest.ini_options]

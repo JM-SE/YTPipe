@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-SHORTS_TITLE_MARKERS = ("#shorts",)
-SHORTS_MAX_DURATION_SECONDS = 60
+from app.services.youtube_video_metadata import (
+    SHORTS_MAX_DURATION_SECONDS,
+    SHORTS_TITLE_MARKERS,
+    parse_iso8601_duration_seconds,
+    title_indicates_short,
+)
 QUOTA_ALERT_THRESHOLDS = (50, 75, 90)
 
 from googleapiclient.discovery import build
@@ -1004,8 +1007,7 @@ class YouTubePollingService:
 
     @staticmethod
     def _title_indicates_short(title: str) -> bool:
-        lower_title = title.lower()
-        return any(marker in lower_title for marker in SHORTS_TITLE_MARKERS)
+        return title_indicates_short(title)
 
     def _fetch_video_duration_seconds(
         self,
@@ -1033,13 +1035,7 @@ class YouTubePollingService:
 
     @staticmethod
     def _parse_iso8601_duration_seconds(value: str) -> int | None:
-        match = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", value)
-        if not match:
-            return None
-        hours = int(match.group(1) or 0)
-        minutes = int(match.group(2) or 0)
-        seconds = int(match.group(3) or 0)
-        return hours * 3600 + minutes * 60 + seconds
+        return parse_iso8601_duration_seconds(value)
 
     def _check_and_send_quota_alert(
         self,

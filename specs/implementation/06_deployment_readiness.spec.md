@@ -51,6 +51,9 @@ Environment variable contract:
 | `POLL_QUOTA_DAILY_BUDGET` | Daily YouTube quota budget used by the polling safety guard. |
 | `POLL_QUOTA_SAFETY_STOP_ENABLED` | Enables/disables quota safety stop. |
 | `SHORTS_PROCESSING_ENABLED` | Globally enables or disables downstream processing and notifications for detected Shorts. |
+| `TELEGRAM_COMMANDS_ENABLED` | Enables inbound Telegram command intake; disabled by default. |
+| `TELEGRAM_ALLOWED_USER_ID` | Exact Telegram sender ID authorized for inbound commands. |
+| `TELEGRAM_BOT_USERNAME` | Configured bot username used to validate command suffixes. |
 | `EMAIL_DELIVERY_MODE` | `fake` for staging/test; `resend` for production final. |
 | `RESEND_API_KEY` | Required only for real Resend delivery. |
 | `RESEND_FROM_EMAIL` | Required only for real Resend delivery. |

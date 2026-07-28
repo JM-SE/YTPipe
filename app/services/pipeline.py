@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Callable
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import exists, or_, select
+from sqlalchemy.orm import Session, aliased
 
 from app.models.channel import Channel
 from app.models.pipeline_stage import PipelineStage
@@ -74,6 +74,13 @@ class PipelineDrainStats:
     summary_attempted: bool = False
 
 
+@dataclass
+class ContentProcessingResult:
+    outcome: str
+    error: str | None = None
+    summary_attempted: bool = False
+
+
 class PipelineService:
     def __init__(
         self,
@@ -130,6 +137,86 @@ class PipelineService:
 
         session.flush()
         return stages
+
+    def create_content_stages_for_video(
+        self,
+        session: Session,
+        user_id: int,
+        video_id: int,
+    ) -> list[PipelineStage]:
+        """Create only the shared content stages used by manual commands."""
+        video = session.get(Video, video_id)
+        if video is not None and not self._should_process_video(video):
+            return session.scalars(
+                select(PipelineStage).where(
+                    PipelineStage.video_id == video_id,
+                    PipelineStage.user_id == user_id,
+                )
+            ).all()
+
+        stages: list[PipelineStage] = []
+        for stage_name in (STAGE_TRANSCRIPT, STAGE_SUMMARY):
+            stage = self._get_dependency_stage(session, user_id, video_id, stage_name)
+            if stage is None:
+                stage = PipelineStage(
+                    video_id=video_id,
+                    user_id=user_id,
+                    stage=stage_name,
+                    status=STATUS_PENDING,
+                )
+                session.add(stage)
+                session.flush()
+            stages.append(stage)
+        return stages
+
+    def process_content_stages(
+        self,
+        session: Session,
+        user: User,
+        video: Video,
+    ) -> ContentProcessingResult:
+        """Advance transcript and summary without an automatic Telegram stage."""
+        if not self._should_process_video(video):
+            return ContentProcessingResult("rejected", SHORT_PROCESSING_DISABLED_ERROR)
+
+        stages = self.create_content_stages_for_video(session, user.id, video.id)
+        stage_map = {stage.stage: stage for stage in stages}
+        transcript_stage = stage_map.get(STAGE_TRANSCRIPT)
+        summary_stage = stage_map.get(STAGE_SUMMARY)
+
+        if any(
+            stage is not None and stage.status == STATUS_SKIPPED
+            for stage in (transcript_stage, summary_stage)
+        ):
+            return ContentProcessingResult(
+                "failed",
+                "Shared content processing was previously skipped and cannot be reopened.",
+            )
+
+        self._attempt_transcript_stage(session, transcript_stage, video)
+        if transcript_stage is not None and transcript_stage.status == STATUS_FAILED:
+            self._skip_stage(session, summary_stage)
+            session.flush()
+            return ContentProcessingResult("failed", transcript_stage.last_error)
+        if not self._can_proceed(transcript_stage):
+            session.flush()
+            return ContentProcessingResult(
+                "pending_retry",
+                transcript_stage.last_error if transcript_stage else None,
+            )
+
+        summary_attempted = self._attempt_summary_stage(session, summary_stage, video)
+        self._persist_summary_pause_state(session, user)
+        session.flush()
+        if video.summary is not None and summary_stage is not None and summary_stage.status == STATUS_COMPLETED:
+            return ContentProcessingResult("completed", summary_attempted=summary_attempted)
+        if summary_stage is not None and summary_stage.status == STATUS_FAILED:
+            return ContentProcessingResult("failed", summary_stage.last_error, summary_attempted)
+        return ContentProcessingResult(
+            "pending_retry",
+            summary_stage.last_error if summary_stage else None,
+            summary_attempted,
+        )
 
     def process_new_video_stages(
         self,
@@ -216,6 +303,8 @@ class PipelineService:
         self,
         session: Session,
         user: User,
+        *,
+        max_stage_count: int | None = None,
     ) -> PipelineProcessingStats:
         self._skip_disabled_short_stages_for_user(session, user.id)
 
@@ -226,16 +315,20 @@ class PipelineService:
         fallbacks_sent = 0
         summary_attempted = False
 
-        pending_rows = session.execute(
+        pending_query = (
             select(PipelineStage, Video, Channel)
             .join(Video, PipelineStage.video_id == Video.id)
             .join(Channel, Video.channel_id == Channel.id)
             .where(
                 PipelineStage.user_id == user.id,
                 PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
+                self._automatic_stage_intent_filter(user.id),
             )
             .order_by(PipelineStage.id.asc())
-        ).all()
+        )
+        if max_stage_count is not None:
+            pending_query = pending_query.limit(max(0, max_stage_count))
+        pending_rows = session.execute(pending_query).all()
 
         if not pending_rows:
             return PipelineProcessingStats(
@@ -362,6 +455,7 @@ class PipelineService:
             .where(
                 PipelineStage.user_id == user.id,
                 PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
+                self._automatic_stage_intent_filter(user.id),
             )
             .order_by(Video.published_at.asc().nullsfirst(), Video.id.asc())
             .limit(1)
@@ -392,6 +486,7 @@ class PipelineService:
             .where(
                 PipelineStage.user_id == user.id,
                 PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
+                self._automatic_stage_intent_filter(user.id),
             )
             .group_by(Video.id, Video.published_at)
             .order_by(Video.published_at.asc().nullsfirst(), Video.id.asc())
@@ -451,6 +546,7 @@ class PipelineService:
             .where(
                 PipelineStage.user_id == user.id,
                 PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
+                self._automatic_stage_intent_filter(user.id),
             )
             .order_by(PipelineStage.id.asc())
             .limit(self.startup_batch_size)
@@ -469,7 +565,11 @@ class PipelineService:
             "Processing pending pipeline stages: %d stage(s) in batch",
             len(pending_rows),
         )
-        stats = self.process_pending_stages(session=session, user=user)
+        stats = self.process_pending_stages(
+            session=session,
+            user=user,
+            max_stage_count=self.startup_batch_size,
+        )
         session.commit()
 
         total_stages_processed += stats.stages_processed
@@ -483,6 +583,7 @@ class PipelineService:
             .where(
                 PipelineStage.user_id == user.id,
                 PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
+                self._automatic_stage_intent_filter(user.id),
             )
             .order_by(PipelineStage.id.asc())
         ).scalars().all()
@@ -501,13 +602,18 @@ class PipelineService:
                     .where(
                         PipelineStage.user_id == user.id,
                         PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
+                        self._automatic_stage_intent_filter(user.id),
                     )
                     .order_by(PipelineStage.id.asc())
                     .limit(self.startup_batch_size)
                 ).scalars().all()
 
                 if batch:
-                    stats = self.process_pending_stages(session=session, user=user)
+                    stats = self.process_pending_stages(
+                        session=session,
+                        user=user,
+                        max_stage_count=self.startup_batch_size,
+                    )
                     session.commit()
                     total_stages_processed += stats.stages_processed
                     total_stages_succeeded += stats.stages_succeeded
@@ -546,7 +652,23 @@ class PipelineService:
         stage.last_attempt_at = attempted_at
 
         try:
-            transcript = self.transcript_service.fetch_transcript(video.youtube_video_id)
+            if type(self.transcript_service) is TranscriptService:
+                result = self.transcript_service.fetch_transcript_result(video.youtube_video_id)
+                transcript = result.text
+                if result.permanent:
+                    stage.status = STATUS_FAILED
+                    stage.last_error = result.error or "Transcript not available for this video."
+                    return
+                if result.outcome == "retryable":
+                    stage.last_error = result.error or "Transcript provider failed temporarily."
+                    stage.status = (
+                        STATUS_FAILED
+                        if stage.attempt_count >= stage.max_attempts
+                        else STATUS_PENDING_RETRY
+                    )
+                    return
+            else:
+                transcript = self.transcript_service.fetch_transcript(video.youtube_video_id)
         except Exception as exc:
             transcript = None
             stage.last_error = str(exc)
@@ -904,6 +1026,20 @@ class PipelineService:
 
     def _should_process_video(self, video: Video) -> bool:
         return self.shorts_processing_enabled or video.is_short is not True
+
+    @staticmethod
+    def _automatic_stage_intent_filter(user_id: int):
+        automatic_stage = aliased(PipelineStage)
+        return or_(
+            PipelineStage.stage.notin_((STAGE_TRANSCRIPT, STAGE_SUMMARY)),
+            exists(
+                select(automatic_stage.id).where(
+                    automatic_stage.video_id == PipelineStage.video_id,
+                    automatic_stage.user_id == user_id,
+                    automatic_stage.stage.in_((STAGE_TELEGRAM, STAGE_FALLBACK_TELEGRAM)),
+                )
+            ),
+        )
 
     def _skip_disabled_short_stages_for_user(self, session: Session, user_id: int) -> None:
         if self.shorts_processing_enabled:

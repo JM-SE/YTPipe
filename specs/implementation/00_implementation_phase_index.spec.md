@@ -37,7 +37,18 @@ These phases add Expo-backed mobile push support after mobile-readiness APIs, wi
 
 1. `11A_mobile_push_schema_settings_service.spec.md` - Add push settings, schema, models, and service skeleton without endpoints, polling integration, or real sends.
 2. `11B_mobile_push_endpoints_status_preferences_test.spec.md` - Add mobile-push endpoints for status, registration, settings, channel preferences, unregister, and synchronous test sends.
-3. `11C_mobile_push_poll_trigger_send_idempotency.spec.md` - Future phase for polling new-video trigger integration, fan-out, and idempotent push delivery behavior.
+3. `11C_mobile_push_poll_trigger_send_idempotency.spec.md` - Deferred future phase for polling new-video trigger integration, fan-out, and idempotent push delivery behavior. It is intentionally not part of the current Telegram workstream.
+
+## Post-MVP Telegram Command Phases
+
+These phases add single-user inbound Telegram `/summary <youtube-url>` commands
+through outbound-only long polling, a durable PostgreSQL command queue, and the
+existing transcript/summary stack. The product and architecture source of truth
+is `specs/telegram_summary_commands.spec.md`.
+
+1. `12A_telegram_command_intake.spec.md` - Add disabled-by-default settings, strict URL parsing, durable command-request schema, canonical metadata boundary, and internal intake API without processing content.
+2. `12B_telegram_command_processing.spec.md` - Add durable claiming/recovery, content-only pipeline reuse, cached-summary behavior, retries, and request-specific Telegram replies without the long-poll listener.
+3. `12C_telegram_long_polling_operations.spec.md` - Add the single-consumer long-poll listener, worker trigger loop, systemd operation, rollout, observability, and end-to-end verification.
 
 ## Dependencies
 - Phase 1 is required before all other phases.
@@ -47,12 +58,31 @@ These phases add Expo-backed mobile push support after mobile-readiness APIs, wi
 - Phase 4 depends on Phase 3 creating `Video` and `NotificationDelivery` records during poll processing.
 - Phase 5 depends on Phases 3 and 4 so hardening validates the real poll and delivery flow rather than placeholders.
 - Phase 6 depends on all prior phases meeting acceptance so deployment work reflects the actual implemented contract.
+- Phase 12A depends on the existing Google OAuth, canonical Channel/Video,
+  internal bearer auth, quota, Shorts, and Telegram configuration foundations.
+- Phase 11C is intentionally deferred while mobile push is out of the active
+  product scope. Its missing implementation/review does not block Phase 12A,
+  provided Phase 12A does not modify mobile-push behavior.
+- Phase 12B depends on reviewed Phase 12A schema/intake contracts and the
+  existing transcript, summary, pipeline retry, and llama.cpp recovery paths.
+- Phase 12C depends on reviewed Phase 12A and 12B internal API contracts and may
+  not access application persistence or content services directly.
+- Phases 12A, 12B, and 12C must be implemented and reviewed sequentially; human
+  approval is required before advancing to the next phase.
 
 ## Risks
 - OAuth token handling can fail if refresh behavior is not treated as a strict persistence contract.
 - YouTube quota usage can drift if quota gating is added after polling behavior instead of before it.
 - Duplicate notifications can leak through if DB constraints and idempotent write paths are deferred.
 - Free-tier hosting assumptions can break unattended operation if deployment checks and smoke tests are skipped.
+- More than one Telegram `getUpdates` consumer can split or lose predictable
+  command handling; Phase 12C permits exactly one listener.
+- Telegram delivery has an unavoidable external at-least-once crash window;
+  durable request identity minimizes but cannot eliminate provider-side
+  duplicates.
+- Long transcript processing can outlive a normal HTTP client timeout, so intake
+  and worker execution must remain independent and recover through durable
+  claims.
 
 ## Acceptance Criteria
 - [ ] The implementation plan is broken into sequential, executable phases.
