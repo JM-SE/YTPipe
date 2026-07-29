@@ -67,3 +67,96 @@ After changing `POLL_INTERVAL_MINUTES` in `.env`, apply it with:
 ```bash
 sudo systemctl restart ytpipe-poll-monitor.service
 ```
+
+## Telegram Command Listener Rollout
+
+The listener uses outbound Telegram long polling and calls only the protected
+API on `127.0.0.1`. It does not access PostgreSQL or llama.cpp directly. Keep
+`TELEGRAM_COMMANDS_ENABLED=false` until the bot and API configuration have
+been validated.
+
+Before enabling the listener, detect and stop every other `getUpdates` or
+webhook consumer:
+
+```bash
+pgrep -af 'ytpipe-telegram-command-listener|getUpdates' || true
+sudo systemctl list-unit-files | grep -Ei 'telegram|ytpipe' || true
+sudo systemctl list-units --all | grep -Ei 'telegram|ytpipe' || true
+```
+
+Stop any known duplicate unit and terminate a manually started listener after
+checking its PID. Verify that no listener remains before continuing:
+
+```bash
+sudo systemctl disable --now ytpipe-telegram-command-listener.service 2>/dev/null || true
+pgrep -af 'ytpipe-telegram-command-listener|getUpdates' || true
+```
+
+Stop or interrupt each remaining process/unit reported above, then require a
+clean check before enabling this unit:
+
+```bash
+if pgrep -af 'ytpipe-telegram-command-listener|getUpdates'; then
+  printf 'A duplicate Telegram consumer is still running.\n' >&2
+  exit 1
+fi
+```
+
+Validate the bot, remove any webhook without dropping updates, and register
+the command. The optional `--drop-pending-updates` flag is only for an
+explicit one-time initial rollout choice:
+
+```bash
+cd /home/jmse/labs/YTPipe
+/home/jmse/labs/YTPipe/.venv/bin/python \
+  scripts/ytpipe-telegram-command-listener.py --configure
+```
+
+Run the listener manually as `jmse` while testing:
+
+```bash
+cd /home/jmse/labs/YTPipe
+/home/jmse/labs/YTPipe/.venv/bin/python \
+  scripts/ytpipe-telegram-command-listener.py
+```
+
+Then write the setting to `.env`, restart the API, and repeat the manual test:
+
+```bash
+sed -i 's/^TELEGRAM_COMMANDS_ENABLED=.*/TELEGRAM_COMMANDS_ENABLED=true/' \
+  /home/jmse/labs/YTPipe/.env
+grep '^TELEGRAM_COMMANDS_ENABLED=' /home/jmse/labs/YTPipe/.env
+sudo systemctl restart ytpipe-api.service
+```
+
+Only after the manual command, cached-repeat, unauthorized-user, disabled-Short,
+and restart-recovery checks pass, install the supervised unit:
+
+```bash
+sudo cp /home/jmse/labs/YTPipe/systemd/ytpipe-telegram-command-listener.service \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ytpipe-telegram-command-listener.service
+sudo systemctl status ytpipe-telegram-command-listener.service --no-pager
+sudo journalctl -u ytpipe-telegram-command-listener.service --no-pager
+```
+
+Routine restarts never use `drop_pending_updates=true`. To roll back, disable
+commands and restart the API before stopping the listener; keep accepted rows
+and the migration intact:
+
+```bash
+sed -i 's/^TELEGRAM_COMMANDS_ENABLED=.*/TELEGRAM_COMMANDS_ENABLED=false/' \
+  /home/jmse/labs/YTPipe/.env
+grep '^TELEGRAM_COMMANDS_ENABLED=' /home/jmse/labs/YTPipe/.env
+sudo systemctl restart ytpipe-api.service
+sudo systemctl disable --now ytpipe-telegram-command-listener.service
+```
+
+Updates that reach the API after commands are disabled are deliberately
+rejected with no durable command row and may be acknowledged by Telegram's
+offset progression. Stop the listener immediately after the API restart; any
+updates still held by Telegram remain available for a later enablement.
+
+Do not run a manual listener and the systemd unit at the same time. The bot
+must have exactly one `getUpdates` consumer.

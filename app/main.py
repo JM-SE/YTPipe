@@ -33,6 +33,11 @@ from app.services.summarization import SummarizationService
 from app.services.telegram import TelegramDeliveryService
 from app.services.transcript import TranscriptService
 
+
+# Telegram Bot API URLs contain the bot token; never emit them through HTTP logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 

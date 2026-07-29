@@ -1,0 +1,21 @@
+[Unit]
+Description=YTPipe Telegram command long-polling listener
+After=network-online.target ytpipe-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jmse
+WorkingDirectory=/home/jmse/labs/YTPipe
+EnvironmentFile=/home/jmse/labs/YTPipe/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/jmse/labs/YTPipe/.venv/bin/python /home/jmse/labs/YTPipe/scripts/ytpipe-telegram-command-listener.py
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGINT
+TimeoutStopSec=450
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
