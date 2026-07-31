@@ -21,7 +21,7 @@ from app.models.video import Video
 from app.services.auth import GoogleOAuthService
 
 
-SHORTS_TITLE_MARKERS = ("#shorts",)
+SHORTS_TITLE_MARKERS = ("#shorts", "#short", "#ytshorts", "ytshorts")
 SHORTS_MAX_DURATION_SECONDS = 60
 QUOTA_PROCESS = "quota"
 RETRYABLE_YOUTUBE_REASONS = {

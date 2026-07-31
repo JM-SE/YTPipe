@@ -50,6 +50,9 @@ is `specs/telegram_summary_commands.spec.md`.
 2. `12B_telegram_command_processing.spec.md` - Add durable claiming/recovery, content-only pipeline reuse, cached-summary behavior, retries, and request-specific Telegram replies without the long-poll listener.
 3. `12C_telegram_long_polling_operations.spec.md` - Add the single-consumer long-poll listener, worker trigger loop, systemd operation, rollout, observability, and end-to-end verification.
 
+Phase 12C status: completed after automated and operator end-to-end
+verification. The listener unit remains available for explicit host rollout.
+
 ## Dependencies
 - Phase 1 is required before all other phases.
 - Phase 2 depends on the Phase 1 app, DB, and migration baseline.

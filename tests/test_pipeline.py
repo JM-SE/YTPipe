@@ -15,6 +15,7 @@ from app.services.pipeline import (
     FALLBACK_REASON_SUMMARY,
     FALLBACK_REASON_TELEGRAM,
     FALLBACK_REASON_TRANSCRIPT,
+    SHORT_PROCESSING_DISABLED_ERROR,
     STAGE_FALLBACK_TELEGRAM,
     STAGE_SUMMARY,
     STAGE_TELEGRAM,
@@ -171,6 +172,89 @@ class TestDisabledShortProcessing:
         summary_service.summarize.assert_not_called()
         stages = db_session.scalars(select(PipelineStage)).all()
         assert {stage.status for stage in stages} == {STATUS_SKIPPED}
+
+    def test_attempt_telegram_stage_skips_confirmed_short_when_disabled(
+        self,
+        db_session,
+        user,
+        channel,
+        video,
+        telegram_service,
+    ):
+        video.is_short = True
+        video.summary = "summary text"
+        db_session.commit()
+
+        stage = PipelineStage(
+            video_id=video.id,
+            user_id=user.id,
+            stage=STAGE_TELEGRAM,
+            status=STATUS_PENDING,
+        )
+        db_session.add(stage)
+        db_session.commit()
+
+        svc = make_pipeline_service(
+            telegram_svc=telegram_service,
+            shorts_processing_enabled=False,
+        )
+        svc._attempt_telegram_stage(db_session, stage, channel, video)
+
+        telegram_service.send_video_notification.assert_not_called()
+        assert stage.status == STATUS_SKIPPED
+        assert stage.last_error == SHORT_PROCESSING_DISABLED_ERROR
+
+    def test_attempt_single_fallback_skips_confirmed_short_when_disabled(
+        self,
+        db_session,
+        user,
+        channel,
+        video,
+        telegram_service,
+    ):
+        video.is_short = True
+        db_session.commit()
+
+        fallback = PipelineStage(
+            video_id=video.id,
+            user_id=user.id,
+            stage=STAGE_FALLBACK_TELEGRAM,
+            status=STATUS_PENDING,
+        )
+        db_session.add(fallback)
+        db_session.commit()
+
+        svc = make_pipeline_service(
+            telegram_svc=telegram_service,
+            shorts_processing_enabled=False,
+        )
+        sent = svc._attempt_single_fallback(db_session, user, channel, video, fallback)
+
+        assert sent is False
+        telegram_service.send_message.assert_not_called()
+        assert fallback.status == STATUS_SKIPPED
+        assert fallback.last_error == SHORT_PROCESSING_DISABLED_ERROR
+
+    def test_attempt_fallback_telegram_skips_confirmed_short_when_disabled(
+        self,
+        db_session,
+        user,
+        channel,
+        video,
+        telegram_service,
+    ):
+        video.is_short = True
+        db_session.commit()
+
+        svc = make_pipeline_service(
+            telegram_svc=telegram_service,
+            shorts_processing_enabled=False,
+        )
+        sent = svc._attempt_fallback_telegram(db_session, user, channel, video, {})
+
+        assert sent is False
+        telegram_service.send_message.assert_not_called()
+        assert db_session.scalars(select(PipelineStage)).all() == []
 
 
 class TestTranscriptStage:

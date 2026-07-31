@@ -843,6 +843,10 @@ class PipelineService:
             return
         if stage.status not in (STATUS_PENDING, STATUS_PENDING_RETRY):
             return
+        if not self.shorts_processing_enabled and video.is_short is True:
+            stage.status = STATUS_SKIPPED
+            stage.last_error = SHORT_PROCESSING_DISABLED_ERROR
+            return
         if self.telegram_service is None:
             stage.status = STATUS_SKIPPED
             return
@@ -894,6 +898,8 @@ class PipelineService:
         video: Video,
         stage_map: dict[str, PipelineStage],
     ) -> bool:
+        if not self.shorts_processing_enabled and video.is_short is True:
+            return False
         if self.telegram_service is None:
             return False
 
@@ -919,6 +925,10 @@ class PipelineService:
         fallback_stage: PipelineStage,
         stage_map: dict[str, PipelineStage] | None = None,
     ) -> bool:
+        if not self.shorts_processing_enabled and video.is_short is True:
+            fallback_stage.status = STATUS_SKIPPED
+            fallback_stage.last_error = SHORT_PROCESSING_DISABLED_ERROR
+            return False
         if self.telegram_service is None:
             return False
         if fallback_stage.status not in (STATUS_PENDING, STATUS_PENDING_RETRY):

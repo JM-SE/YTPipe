@@ -832,6 +832,11 @@ class YouTubePollingService:
         *,
         is_retry: bool,
     ) -> None:
+        if not self.shorts_processing_enabled and video.is_short is True:
+            delivery.status = DELIVERY_SKIPPED_STATUS
+            delivery.last_error = SHORT_PROCESSING_DISABLED_ERROR
+            return
+
         youtube_video_id = video.youtube_video_id
         attempted_at = datetime.now(UTC)
 
@@ -997,9 +1002,18 @@ class YouTubePollingService:
                 youtube, video.youtube_video_id, quota_context
             )
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "Short classification duration lookup failed for video %s",
+                video.youtube_video_id,
+                exc_info=True,
+            )
             return
 
         if duration_seconds is None:
+            logger.warning(
+                "Short classification duration unavailable for video %s",
+                video.youtube_video_id,
+            )
             return
 
         video.is_short = duration_seconds <= SHORTS_MAX_DURATION_SECONDS

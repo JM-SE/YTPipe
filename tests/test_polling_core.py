@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -1618,6 +1619,163 @@ def test_run_poll_skips_disabled_short_processing(db_session, monkeypatch) -> No
     assert db_session.query(NotificationDelivery).count() == 0
     assert db_session.query(PipelineStage).count() == 0
     assert user_channel.last_seen_video_id == "video-short"
+
+
+def test_run_poll_classifies_short_with_broadened_title_marker(db_session, monkeypatch) -> None:
+    client = TestClient(app)
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        POLL_QUOTA_DAILY_BUDGET=50,
+        POLL_QUOTA_SAFETY_STOP_ENABLED=True,
+        SHORTS_PROCESSING_ENABLED=False,
+        GOOGLE_CLIENT_ID="client-id",
+        GOOGLE_CLIENT_SECRET="client-secret",
+        DATABASE_URL="sqlite://",
+    )
+
+    user = User(email="owner@example.com")
+    channel = Channel(youtube_channel_id="channel-a", title="A", uploads_playlist_id="uploads-a")
+    db_session.add_all([user, channel])
+    db_session.flush()
+    user_channel = UserChannel(
+        user_id=user.id,
+        channel_id=channel.id,
+        is_monitored=True,
+        last_seen_video_id="video-old",
+        baseline_established_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    db_session.add(user_channel)
+    db_session.add(
+        OAuthAccount(
+            user_id=user.id,
+            provider="google",
+            access_token="token",
+            refresh_token="refresh",
+            token_expiry=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        polling_module.GoogleOAuthService,
+        "ensure_valid_credentials",
+        lambda self, session, oauth_account: object(),  # noqa: ARG005
+    )
+
+    class FakeRequest:
+        def execute(self):
+            return {
+                "items": [
+                    {
+                        "snippet": {"title": "Receta en 30s #short", "publishedAt": "2026-04-25T12:00:00Z"},
+                        "contentDetails": {"videoId": "video-short-marker"},
+                    }
+                ]
+            }
+
+    class FakePlaylistItemsResource:
+        def list(self, **kwargs):  # noqa: ARG002
+            return FakeRequest()
+
+    class FakeYouTube:
+        def playlistItems(self):
+            return FakePlaylistItemsResource()
+
+    monkeypatch.setattr(polling_module, "build", lambda *args, **kwargs: FakeYouTube())
+
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+
+    try:
+        response = client.post(
+            "/internal/run-poll",
+            headers={"Authorization": "Bearer internal-secret"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    video = db_session.query(Video).one()
+    assert video.is_short is True
+    assert db_session.query(NotificationDelivery).count() == 0
+    assert db_session.query(PipelineStage).count() == 0
+    assert user_channel.last_seen_video_id == "video-short-marker"
+
+
+def test_attempt_detect_and_mark_short_logs_duration_lookup_failure(db_session, monkeypatch, caplog) -> None:
+    import logging
+
+    channel = Channel(youtube_channel_id="channel-a", title="A", uploads_playlist_id="uploads-a")
+    db_session.add(channel)
+    db_session.flush()
+    video = Video(
+        youtube_video_id="video-unclassified",
+        channel_id=channel.id,
+        title="No marker in title",
+        published_at=datetime.now(UTC),
+    )
+    db_session.add(video)
+    db_session.commit()
+
+    svc = YouTubePollingService(
+        auth_service=MagicMock(),
+        email_service=MagicMock(),
+        daily_quota_budget=50,
+        safety_stop_enabled=True,
+        shorts_processing_enabled=False,
+    )
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("quota exhausted")
+
+    monkeypatch.setattr(svc, "_fetch_video_duration_seconds", boom)
+
+    with caplog.at_level(logging.WARNING, logger="app.services.polling"):
+        svc._attempt_detect_and_mark_short(db_session, object(), video, {"last_run_estimated_units": 0, "estimated_units_used_today": 0})
+
+    db_session.refresh(video)
+    assert video.is_short is None
+    assert any("duration lookup failed" in record.message for record in caplog.records)
+
+
+def test_attempt_delivery_send_skips_confirmed_short_when_disabled(db_session) -> None:
+    from app.services.polling import DELIVERY_SKIPPED_STATUS, SHORT_PROCESSING_DISABLED_ERROR
+
+    user = User(email="owner@example.com")
+    channel = Channel(youtube_channel_id="channel-a", title="A", uploads_playlist_id="uploads-a")
+    db_session.add_all([user, channel])
+    db_session.flush()
+    video = Video(
+        youtube_video_id="video-short",
+        channel_id=channel.id,
+        title="Short",
+        published_at=datetime.now(UTC),
+        is_short=True,
+    )
+    db_session.add(video)
+    db_session.flush()
+    delivery = NotificationDelivery(
+        user_id=user.id,
+        video_id=video.id,
+        status="pending",
+    )
+    db_session.add(delivery)
+    db_session.commit()
+
+    email_service = MagicMock()
+    svc = YouTubePollingService(
+        auth_service=MagicMock(),
+        email_service=email_service,
+        daily_quota_budget=50,
+        safety_stop_enabled=True,
+        shorts_processing_enabled=False,
+    )
+    svc._attempt_delivery_send(delivery, user, channel, video, is_retry=False)
+
+    email_service.send_video_notification.assert_not_called()
+    assert delivery.status == DELIVERY_SKIPPED_STATUS
+    assert delivery.last_error == SHORT_PROCESSING_DISABLED_ERROR
 
 
 def test_run_poll_quota_alert_sent_at_threshold(db_session, monkeypatch) -> None:
