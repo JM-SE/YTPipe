@@ -1,0 +1,21 @@
+[Unit]
+Description=YTPipe llama.cpp health and recovery monitor
+After=network-online.target llama-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jmse
+WorkingDirectory=/home/jmse/labs/YTPipe
+EnvironmentFile=/home/jmse/labs/YTPipe/.env
+Environment=YTPipe_LLAMA_MONITOR_STATE_DIR=/home/jmse/.local/state/ytpipe-llama-monitor
+Environment=YTPipe_LLAMA_MONITOR_INTERVAL_SECONDS=10
+Environment=YTPipe_LLAMA_MONITOR_REQUEST_TIMEOUT_SECONDS=5
+ExecStart=/home/jmse/labs/YTPipe/scripts/ytpipe-llama-monitor.sh
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

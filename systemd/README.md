@@ -10,6 +10,12 @@ These units are intentionally not installed automatically. Installing or replaci
 6. Set `POLL_INTERVAL_MINUTES` in `.env` to a positive whole number. The default and current local value is `60`; restart the service after changing it.
 7. Set `LLAMA_CPP_AUTO_RESTART_ENABLED=true` only after installing and validating the narrow sudoers rule below.
 
+The llama.cpp monitor is independent from the API and PostgreSQL path. It sends
+one Telegram alert when `llama-server.service` becomes unhealthy, and sends a
+recovery alert only after systemd is active and both `/health` and `/v1/models`
+respond successfully. Its state is stored outside PostgreSQL so it remains
+useful during an application or database incident.
+
 ## Operator Commands
 
 After validating the current manual llama.cpp process, restore systemd ownership so it starts after reboot:
@@ -30,6 +36,36 @@ sudo -u jmse sudo -n /usr/bin/systemctl restart llama-server.service
 ```
 
 Then enable recovery in `.env` with `LLAMA_CPP_AUTO_RESTART_ENABLED=true`. The default cooldown is 300 seconds and can be changed with `LLAMA_CPP_RESTART_COOLDOWN_SECONDS`. Restart `ytpipe-api.service` after changing these settings.
+
+## Llama.cpp Monitor Rollout
+
+Install the monitor only after confirming that `TELEGRAM_NOTIFICATIONS_ENABLED`,
+`TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` are configured in `.env`:
+
+```bash
+sudo cp /home/jmse/labs/YTPipe/systemd/ytpipe-llama-monitor.service \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ytpipe-llama-monitor.service
+sudo systemctl status ytpipe-llama-monitor.service --no-pager
+sudo journalctl -u ytpipe-llama-monitor.service --no-pager
+```
+
+The monitor checks every 10 seconds by default. It keeps state in
+`/home/jmse/.local/state/ytpipe-llama-monitor` and does not send an alert on
+its first healthy check. To validate it without installing the unit:
+
+```bash
+set -a
+. /home/jmse/labs/YTPipe/.env
+set +a
+/home/jmse/labs/YTPipe/scripts/ytpipe-llama-monitor.sh --once
+```
+
+Restarts are detected through the systemd main PID/start timestamp even when
+the downtime is shorter than one monitor interval. The monitor does not
+perform an inference request; `/health` plus `/v1/models` is the configured
+recovery criterion.
 
 The selected AMD GPU PPT cap is 100 W. The kernel exposes the current cap at
 `/sys/class/drm/card0/device/hwmon/hwmon0/power1_cap` in microwatts and requires root:
