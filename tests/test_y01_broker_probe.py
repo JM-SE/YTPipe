@@ -131,8 +131,22 @@ def test_synthetic_probe_uses_fixed_payload_and_returns_sanitized_result() -> No
         body = httpx.Response(200, request=requests[0], content=requests[0].content).json()
         assert body["workload"] == "batch-summary"
         assert body["capability"] == "summarize"
-        assert "La energía solar" in body["messages"][1]["content"]
+        assert "paneles solares" in body["messages"][1]["content"]
         assert "Authorization" not in body["messages"][1]["content"]
+    finally:
+        client.close()
+
+
+def test_synthetic_probe_reports_output_validation_separately() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        invalid = _result()
+        invalid["result"]["content"] = "respuesta libre"
+        return _response(200, invalid, request)
+
+    client = _client(handler)
+    try:
+        result = BrokerProbeService(client).synthetic("probe-invalid-output")
+        assert result == type(result)("failed", "broker_output_invalid")
     finally:
         client.close()
 
@@ -173,7 +187,7 @@ def test_async_probe_rejects_unsafe_location_without_polling(location: str) -> N
     client = _client(handler)
     try:
         result = BrokerProbeService(client).synthetic("probe-location")
-        assert result == type(result)("failed", "broker_error")
+        assert result == type(result)("failed", "broker_location_invalid")
         assert len(calls) == 1
     finally:
         client.close()
@@ -188,7 +202,7 @@ def test_async_probe_rejects_malformed_terminal_envelope() -> None:
     client = _client(handler)
     try:
         result = BrokerProbeService(client).synthetic("probe-error")
-        assert result == type(result)("failed", "broker_error")
+        assert result == type(result)("failed", "broker_protocol_error")
     finally:
         client.close()
 

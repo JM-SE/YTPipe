@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Callable, Protocol
 
+from app.services.broker_errors import BrokerSummarizationError
 from app.services.broker_gateway import BrokerOperation, BrokerTaskClient
 from app.services.broker_summary import validate_broker_output
 from app.services.summarization import FINAL_SUMMARY_INSTRUCTIONS, SUMMARIZATION_SYSTEM_PROMPT
@@ -12,7 +13,14 @@ from app.services.transcript import TranscriptFetchResult
 from app.services.youtube_video_url import ParsedYouTubeVideoURL
 
 PROBE_NAMESPACE = "ytpipe-broker-probe-v1"
-SYNTHETIC_TRANSCRIPT = "La energía solar convierte la luz del sol en electricidad limpia y renovable."
+SYNTHETIC_TRANSCRIPT = (
+    "Un proyecto piloto instaló paneles solares en una escuela rural para reducir su consumo de la red. "
+    "La instalación tiene una capacidad de 20 kilovatios y empezó a operar en marzo. "
+    "El equipo docente incorporó el proyecto a las clases de ciencias y registra la producción cada semana. "
+    "Durante los primeros tres meses, la escuela redujo en un 30 por ciento la electricidad comprada. "
+    "La comunidad aportó mano de obra para preparar el tejado y el municipio financió los equipos. "
+    "El informe recomienda revisar las baterías antes de ampliar el sistema a otros edificios."
+)
 SYNTHETIC_PROMPT = FINAL_SUMMARY_INSTRUCTIONS + "\n\nTRANSCRIPCION:\n\n" + SYNTHETIC_TRANSCRIPT
 SYNTHETIC_SYSTEM_PROMPT = SUMMARIZATION_SYSTEM_PROMPT
 SYNTHETIC_MAX_TOKENS = 512
@@ -57,6 +65,10 @@ class BrokerProbeService:
         try:
             summary = self._client.submit(operation, probe_idempotency_key("synthetic", pid, "submit", 0))
             validate_broker_output(summary)
+        except BrokerSummarizationError as exc:
+            return BrokerProbeResult("failed", _diagnostic_category(exc.code))
+        except ValueError:
+            return BrokerProbeResult("failed", "broker_output_invalid")
         except Exception:
             return BrokerProbeResult("failed", "broker_error")
         self._last_summary = summary
@@ -77,6 +89,10 @@ class BrokerProbeService:
         try:
             summary = self._client.submit(operation, probe_idempotency_key("youtube", pid, "submit", 0))
             validate_broker_output(summary)
+        except BrokerSummarizationError as exc:
+            return BrokerProbeResult("failed", _diagnostic_category(exc.code))
+        except ValueError:
+            return BrokerProbeResult("failed", "broker_output_invalid")
         except Exception:
             return BrokerProbeResult("failed", "broker_error")
         self._last_summary = summary
@@ -87,3 +103,20 @@ class BrokerProbeService:
         if not isinstance(candidate, str) or not candidate or len(candidate) > 128 or any(c.isspace() for c in candidate):
             raise ValueError("Invalid probe ID.")
         return candidate
+
+
+def _diagnostic_category(code: str) -> str:
+    """Expose only stable local/broker classes, never remote error details."""
+    allowed = {
+        "broker_unauthorized",
+        "broker_invalid_request",
+        "broker_timeout",
+        "broker_transport_error",
+        "broker_protocol_error",
+        "broker_location_invalid",
+        "broker_task_failed",
+        "broker_task_cancelled",
+        "broker_task_expired",
+        "broker_output_invalid",
+    }
+    return code if code in allowed else "broker_error"
