@@ -1,0 +1,89 @@
+from __future__ import annotations
+
+import secrets
+from dataclasses import dataclass
+from hashlib import sha256
+from typing import Callable, Protocol
+
+from app.services.broker_gateway import BrokerOperation, BrokerTaskClient
+from app.services.broker_summary import validate_broker_output
+from app.services.summarization import FINAL_SUMMARY_INSTRUCTIONS, SUMMARIZATION_SYSTEM_PROMPT
+from app.services.transcript import TranscriptFetchResult
+from app.services.youtube_video_url import ParsedYouTubeVideoURL
+
+PROBE_NAMESPACE = "ytpipe-broker-probe-v1"
+SYNTHETIC_TRANSCRIPT = "La energía solar convierte la luz del sol en electricidad limpia y renovable."
+SYNTHETIC_PROMPT = "Resume este texto en español con el formato exacto solicitado."
+SYNTHETIC_SYSTEM_PROMPT = "Eres un resumidor fiel. Responde solo con el formato solicitado."
+SYNTHETIC_MAX_TOKENS = 512
+
+
+class ProbeTranscriptService(Protocol):
+    def fetch_transcript_result(self, youtube_video_id: str) -> TranscriptFetchResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerProbeResult:
+    status: str
+    category: str
+
+
+def probe_idempotency_key(probe_kind: str, probe_id: str, operation: str, ordinal: int) -> str:
+    values = (PROBE_NAMESPACE, "b00-v0.1", probe_kind, probe_id, operation, str(ordinal))
+    encoded = b"".join(len(v.encode()).to_bytes(4, "big") + v.encode() for v in values)
+    return sha256(encoded).hexdigest()
+
+
+class BrokerProbeService:
+    def __init__(self, task_client: BrokerTaskClient, *, max_transcript_characters: int = 30_000,
+                 probe_id_factory: Callable[[], str] = lambda: secrets.token_hex(16)):
+        if max_transcript_characters < 1:
+            raise ValueError("Invalid transcript cap.")
+        self._client = task_client
+        self._cap = max_transcript_characters
+        self._probe_id_factory = probe_id_factory
+        self._last_summary: str | None = None
+
+    @property
+    def summary_for_display(self) -> str | None:
+        """Content is available only for the CLI's explicit TTY display path."""
+        return self._last_summary
+
+    def synthetic(self, probe_id: str | None = None) -> BrokerProbeResult:
+        self._last_summary = None
+        pid = self._probe_id(probe_id)
+        operation = BrokerOperation("synthetic", 0, SYNTHETIC_SYSTEM_PROMPT, SYNTHETIC_PROMPT + "\n\n" + SYNTHETIC_TRANSCRIPT,
+                                    SYNTHETIC_MAX_TOKENS)
+        try:
+            summary = self._client.submit(operation, probe_idempotency_key("synthetic", pid, "submit", 0))
+            validate_broker_output(summary)
+        except Exception:
+            return BrokerProbeResult("failed", "broker_error")
+        self._last_summary = summary
+        return BrokerProbeResult("succeeded", "synthetic_accepted")
+
+    def youtube(self, parsed_url: ParsedYouTubeVideoURL, transcript_service: ProbeTranscriptService,
+                probe_id: str | None = None) -> BrokerProbeResult:
+        self._last_summary = None
+        pid = self._probe_id(probe_id)
+        fetched = transcript_service.fetch_transcript_result(parsed_url.video_id)
+        if not fetched.completed or not fetched.text:
+            return BrokerProbeResult("failed", "transcript_unavailable")
+        if len(fetched.text) > self._cap:
+            return BrokerProbeResult("failed", "transcript_too_large")
+        operation = BrokerOperation("youtube", 0, SUMMARIZATION_SYSTEM_PROMPT,
+                                    FINAL_SUMMARY_INSTRUCTIONS + "\n\nTRANSCRIPCION:\n\n" + fetched.text,
+                                    SYNTHETIC_MAX_TOKENS)
+        try:
+            summary = self._client.submit(operation, probe_idempotency_key("youtube", pid, "submit", 0))
+            validate_broker_output(summary)
+        except Exception:
+            return BrokerProbeResult("failed", "broker_error")
+        self._last_summary = summary
+        return BrokerProbeResult("succeeded", "youtube_accepted")
+
+    def _probe_id(self, value: str | None) -> str:
+        candidate = value or self._probe_id_factory()
+        if not isinstance(candidate, str) or not candidate or len(candidate) > 128 or any(c.isspace() for c in candidate):
+            raise ValueError("Invalid probe ID.")
+        return candidate

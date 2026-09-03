@@ -66,6 +66,14 @@ class Settings(BaseSettings):
     google_client_id: str = Field(default="", alias="GOOGLE_CLIENT_ID")
     google_client_secret: str = Field(default="", alias="GOOGLE_CLIENT_SECRET")
     google_redirect_uri: str = Field(default="http://127.0.0.1:8000/auth/callback", alias="GOOGLE_REDIRECT_URI")
+    # Probe settings are intentionally inert application settings.  They are
+    # validated only by the manual probe CLI, never by the normal runtime.
+    broker_probes_enabled: bool = Field(default=False, alias="BROKER_PROBES_ENABLED")
+    broker_acceptance_probe_enabled: bool = Field(default=False, alias="BROKER_ACCEPTANCE_PROBE_ENABLED")
+    broker_base_url: str = Field(default="", alias="BROKER_BASE_URL")
+    broker_bearer_token: str = Field(default="", alias="BROKER_BEARER_TOKEN")
+    broker_timeout_seconds: float | None = Field(default=None, alias="BROKER_TIMEOUT_SECONDS")
+    broker_probe_max_transcript_characters: int = Field(default=30_000, alias="BROKER_PROBE_MAX_TRANSCRIPT_CHARACTERS")
 
     @property
     def normalized_telegram_bot_username(self) -> str:

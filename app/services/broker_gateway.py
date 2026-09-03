@@ -15,6 +15,43 @@ from app.services.summarization_gateway import SummaryGatewayContext, SummaryOpe
 from app.services.summarization_planner import plan_operations
 
 
+BrokerOperation = SummaryOperation
+
+
+class BrokerTaskClient:
+    """Reusable B00 task protocol client for non-pipeline callers."""
+
+    def __init__(self, *, base_url: str, credential: str, transport: httpx.BaseTransport,
+                 timeout: float, monotonic: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep):
+        self._gateway = BrokerSummarizationGateway(
+            base_url=base_url, credential=credential, transport=transport,
+            timeout=timeout, monotonic=monotonic, sleep=sleep,
+        )
+
+    @classmethod
+    def from_client(cls, client: httpx.Client, *, timeout: float,
+                    monotonic: Callable[[], float] = time.monotonic,
+                    sleep: Callable[[float], None] = time.sleep) -> "BrokerTaskClient":
+        instance = cls.__new__(cls)
+        gateway = BrokerSummarizationGateway.__new__(BrokerSummarizationGateway)
+        gateway._base_url = str(client.base_url).rstrip("/")
+        gateway._credential = ""
+        gateway._timeout = min(float(timeout), 300.0)
+        gateway._max_tokens = 0
+        gateway._clock = monotonic
+        gateway._sleep = sleep
+        gateway._client = client
+        instance._gateway = gateway
+        return instance
+
+    def close(self) -> None:
+        self._gateway.close()
+
+    def submit(self, operation: BrokerOperation, idempotency_key_value: str) -> str:
+        return self._gateway._submit_with_key(operation, idempotency_key_value)
+
+
 class BrokerSummarizationGateway:
     """Dormant B00 client. Construction requires an explicitly injected transport."""
 
@@ -27,7 +64,7 @@ class BrokerSummarizationGateway:
         self._max_tokens = max_tokens
         self._clock = monotonic
         self._sleep = sleep
-        self._client = httpx.Client(base_url=self._base_url, transport=transport)
+        self._client = httpx.Client(base_url=self._base_url, transport=transport, follow_redirects=False, trust_env=False)
 
     def close(self) -> None:
         self._client.close()
@@ -50,6 +87,9 @@ class BrokerSummarizationGateway:
 
     def submit(self, operation: SummaryOperation, context: SummaryGatewayContext) -> str:
         key = idempotency_key(context, operation)
+        return self._submit_with_key(operation, key)
+
+    def _submit_with_key(self, operation: SummaryOperation, key: str) -> str:
         generation: dict[str, object] = {
             "max_tokens": operation.max_tokens,
             "temperature": 0.7,
@@ -109,7 +149,7 @@ class BrokerSummarizationGateway:
 
     def _request(self, method: str, path: str, *, key: str | None = None,
                  json: object = None, prefer: bool = False, timeout: float | None = None) -> httpx.Response:
-        headers = {"Authorization": f"Bearer {self._credential}"}
+        headers = {} if not self._credential else {"Authorization": f"Bearer {self._credential}"}
         if key:
             headers.update({"Idempotency-Key": key, "Content-Type": "application/json"})
         if prefer:
@@ -175,7 +215,8 @@ def _valid_usage(value: object) -> bool:
 
 def _validate_task(payload: dict, task_id: str) -> None:
     required = {"id", "workload", "capability", "status", "created_at", "updated_at"}
-    if set(payload) - required or not required <= set(payload):
+    allowed = required | {"attempts"}
+    if set(payload) - allowed or not required <= set(payload):
         raise broker_error("broker_protocol_error")
     if payload["id"] != task_id or not isinstance(payload["id"], str):
         raise broker_error("broker_protocol_error")
