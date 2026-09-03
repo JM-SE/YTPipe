@@ -58,7 +58,7 @@ class SummarizationService:
         self._timeout = settings.llama_cpp_timeout
         self._max_tokens = settings.llama_cpp_max_tokens
 
-    def summarize(self, transcript: str) -> str | None:
+    def summarize(self, transcript: str, *, context=None) -> str | None:
         if len(transcript) <= DIRECT_TRANSCRIPT_CHARACTER_LIMIT:
             return self._request_summary(f"{FINAL_SUMMARY_INSTRUCTIONS}\n\nTRANSCRIPCION:\n\n{transcript}")
 
@@ -168,3 +168,5 @@ class SummarizationService:
 
 class SummarizationRequestError(Exception):
     """A failed local request whose reason belongs on its pipeline stage."""
+
+    recovery_target = "direct_llama"

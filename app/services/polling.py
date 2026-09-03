@@ -392,6 +392,9 @@ class YouTubePollingService:
         metadata = summarization_state.state_metadata or {}
         pipeline_service.summary_paused = bool(metadata.get("paused", False))
         pipeline_service.summary_pause_reason = metadata.get("last_error")
+        failure = metadata.get("summary_failure")
+        target = failure.get("recovery_target") if isinstance(failure, dict) else None
+        pipeline_service._summary_recovery_target = target if target in {"direct_llama", "none"} else "direct_llama"
         failed_video_id = metadata.get("failed_video_id")
         pipeline_service.summary_pause_video_id = failed_video_id if isinstance(failed_video_id, int) else None
 
@@ -431,12 +434,18 @@ class YouTubePollingService:
             reason = self.pipeline_service.summary_pause_reason or "Unknown summarization failure."
             metadata["last_error"] = reason
             metadata["last_failure_at"] = now.isoformat()
+            failure = dict(metadata.get("summary_failure") or {})
+            target = failure.get("recovery_target", "direct_llama")
+            failure["recovery_target"] = target if target in {"direct_llama", "none"} else "direct_llama"
+            metadata["summary_failure"] = failure
             if not was_paused:
                 metadata["incident_started_at"] = now.isoformat()
                 metadata["alert_sent"] = False
 
             restart_message = "Automatic llama.cpp restart is not configured."
-            if self._restart_allowed(metadata, now):
+            if metadata["summary_failure"]["recovery_target"] == "none":
+                restart_message = "Automatic llama.cpp restart is not applicable to this failure."
+            elif self._restart_allowed(metadata, now):
                 result = self.llama_recovery_service.restart() if self.llama_recovery_service else None
                 if result is not None:
                     metadata["restart_attempted_at"] = now.isoformat()
@@ -457,6 +466,7 @@ class YouTubePollingService:
                     metadata["recovery_pending_alert"] = False
             metadata["alert_sent"] = False
             metadata["paused"] = False
+            metadata.pop("summary_failure", None)
             summarization_state.last_success_at = now
             summarization_state.last_error_at = None
             summarization_state.last_error_message = None

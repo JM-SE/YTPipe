@@ -18,6 +18,7 @@ from app.models.video import Video
 from app.services.summarization import SummarizationService
 from app.services.telegram import TelegramDeliveryAttemptError, TelegramDeliveryService, TelegramNotificationPayload
 from app.services.transcript import TranscriptService
+from app.services.summarization_gateway import SummaryGatewayContext
 
 logger = logging.getLogger(__name__)
 _SUMMARY_INFERENCE_LOCK = threading.Lock()
@@ -719,20 +720,28 @@ class PipelineService:
             # llama.cpp runs on the local homelab GPU. Keep every entrypoint to
             # the model serialized, including retries and incident recovery.
             with _SUMMARY_INFERENCE_LOCK:
-                summary = self.summarization_service.summarize(video.transcript)
+                summary = self.summarization_service.summarize(
+                    video.transcript, context=SummaryGatewayContext(stage_id=stage.id)
+                )
         except Exception as exc:
             summary = None
             stage.last_error = _compact_error(str(exc))
+            recovery_target = getattr(exc, "recovery_target", "direct_llama")
+            if recovery_target not in {"direct_llama", "none"}:
+                recovery_target = "direct_llama"
             self.summary_paused = True
             self.summary_pause_reason = stage.last_error
             self.summary_pause_video_id = video.id
             stage.status = STATUS_PENDING_RETRY
+            self._summary_recovery_target = recovery_target
             return True
 
         if summary:
             video.summary = summary
             stage.status = STATUS_COMPLETED
             stage.last_error = None
+            self._summary_recovery_target = None
+            self._clear_summary_failure_state(session, user_id=stage.user_id)
             return True
 
         if stage.last_error is None:
@@ -748,6 +757,13 @@ class PipelineService:
         """Attempt at most one real pending summary while the circuit is open."""
         if not self.summary_paused:
             return True
+        # Broker failures are deliberately not recoverable through the local
+        # llama path. Keep the circuit and retryable stage intact until the
+        # broker is available again. Legacy/missing metadata defaults to the
+        # direct llama recovery target below.
+        if getattr(self, "_summary_recovery_target", None) == "none":
+            self.summary_recovery_succeeded = False
+            return False
 
         recovery_query = (
             select(PipelineStage, Video)
@@ -801,12 +817,32 @@ class PipelineService:
         metadata["paused"] = True
         metadata["recovery_pending_alert"] = False
         metadata["last_error"] = self.summary_pause_reason or "Unknown summarization failure."
+        failure = dict(metadata.get("summary_failure") or {})
+        target = getattr(self, "_summary_recovery_target", None) or failure.get("recovery_target") or "direct_llama"
+        failure["recovery_target"] = target if target in {"direct_llama", "none"} else "direct_llama"
+        metadata["summary_failure"] = failure
         if self.summary_pause_video_id is not None:
             metadata["failed_video_id"] = self.summary_pause_video_id
         metadata.setdefault("alert_sent", False)
         metadata.setdefault("incident_started_at", datetime.now(UTC).isoformat())
         state.last_error_at = datetime.now(UTC)
         state.last_error_message = metadata["last_error"]
+        state.state_metadata = metadata
+        session.flush()
+
+    def _clear_summary_failure_state(self, session: Session, *, user_id: int) -> None:
+        state = session.scalar(
+            select(SyncState).where(
+                SyncState.user_id == user_id,
+                SyncState.process_type == SUMMARIZATION_PROCESS,
+            )
+        )
+        if state is None:
+            return
+        metadata = dict(state.state_metadata or {})
+        if "summary_failure" not in metadata:
+            return
+        metadata.pop("summary_failure", None)
         state.state_metadata = metadata
         session.flush()
 
@@ -826,6 +862,7 @@ class PipelineService:
         metadata["paused"] = False
         metadata["recovery_pending_alert"] = True
         metadata["recovered_at"] = datetime.now(UTC).isoformat()
+        metadata.pop("summary_failure", None)
         state.last_success_at = datetime.now(UTC)
         state.last_error_at = None
         state.last_error_message = None

@@ -22,7 +22,7 @@ from app.services.llama_recovery import LlamaRecoveryService
 from app.services.mobile_push import MobilePushService
 from app.services.pipeline import PipelineService
 from app.services.polling import POLLING_PROCESS, YouTubePollingService
-from app.services.summarization import SummarizationService
+from app.services.direct_summarization import build_summarization_gateway
 from app.services.telegram import TelegramDeliveryService
 from app.services.transcript import TranscriptService
 
@@ -228,10 +228,10 @@ def _build_polling_service(settings: Settings) -> YouTubePollingService:
         mobile_push_service=MobilePushService(settings),
         telegram_service=TelegramDeliveryService(settings),
         transcript_service=TranscriptService(settings),
-        summarization_service=SummarizationService(settings),
+        summarization_service=build_summarization_gateway(settings),
         pipeline_service=PipelineService(
             transcript_service=TranscriptService(settings),
-            summarization_service=SummarizationService(settings),
+            summarization_service=build_summarization_gateway(settings),
             telegram_service=TelegramDeliveryService(settings),
             startup_batch_size=settings.pipeline_startup_batch_size,
             startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,

@@ -29,7 +29,7 @@ from app.models.user import User
 from app.services.pipeline import PipelineService
 from app.services.execution_lock import ExecutionLockBusy, acquire_execution_lock
 from app.services.polling import SUMMARIZATION_PROCESS
-from app.services.summarization import SummarizationService
+from app.services.direct_summarization import build_summarization_gateway
 from app.services.telegram import TelegramDeliveryService
 from app.services.transcript import TranscriptService
 
@@ -169,7 +169,7 @@ def _process_pending_pipeline_startup(settings: Settings) -> None:
             with acquire_execution_lock(session):
                 pipeline_service = PipelineService(
                     transcript_service=TranscriptService(settings),
-                    summarization_service=SummarizationService(settings),
+                    summarization_service=build_summarization_gateway(settings),
                     telegram_service=TelegramDeliveryService(settings),
                     startup_batch_size=settings.pipeline_startup_batch_size,
                     startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,

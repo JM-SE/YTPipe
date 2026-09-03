@@ -18,7 +18,7 @@ from app.services.auth import GOOGLE_PROVIDER, GoogleOAuthService
 from app.services.execution_lock import acquire_execution_lock
 from app.services.llama_recovery import LlamaRecoveryService
 from app.services.pipeline import PipelineService
-from app.services.summarization import SummarizationService
+from app.services.direct_summarization import build_summarization_gateway
 from app.services.telegram import TelegramDeliveryAttemptError, TelegramDeliveryService
 from app.services.transcript import TranscriptService
 from app.services.youtube_video_metadata import YouTubeMetadataError, YouTubeVideoMetadataService
@@ -317,7 +317,7 @@ class TelegramCommandQueueService:
         elif content_result.outcome == "failed":
             self._finish_processing(request, token, "failed", content_result.error)
         else:
-            if pipeline.summary_paused:
+            if pipeline.summary_paused and getattr(pipeline, "_summary_recovery_target", "direct_llama") != "none":
                 self._attempt_llama_recovery(user.id)
             self._finish_processing(
                 request,
@@ -482,13 +482,17 @@ class TelegramCommandQueueService:
         summary_paused = bool(
             summary_state and (summary_state.state_metadata or {}).get("paused", False)
         )
-        return PipelineService(
+        pipeline = PipelineService(
             transcript_service=TranscriptService(self.settings),
-            summarization_service=SummarizationService(self.settings),
+            summarization_service=build_summarization_gateway(self.settings),
             startup_batch_size=0,
             summary_paused=summary_paused,
             shorts_processing_enabled=self.settings.shorts_processing_enabled,
         )
+        failure = (summary_state.state_metadata or {}).get("summary_failure") if summary_state else None
+        target = failure.get("recovery_target") if isinstance(failure, dict) else "direct_llama"
+        pipeline._summary_recovery_target = target if target in {"direct_llama", "none"} else "direct_llama"
+        return pipeline
 
     def _record_google_reauth_pause(self, user_id: int, error: str) -> None:
         state = self.session.scalar(
@@ -520,6 +524,9 @@ class TelegramCommandQueueService:
         if state is None:
             return
         metadata = dict(state.state_metadata or {})
+        failure = metadata.get("summary_failure")
+        if isinstance(failure, dict) and failure.get("recovery_target") == "none":
+            return
         if not self.settings.llama_cpp_auto_restart_enabled:
             return
         previous = metadata.get("restart_attempted_at")
