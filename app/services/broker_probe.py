@@ -13,8 +13,8 @@ from app.services.youtube_video_url import ParsedYouTubeVideoURL
 
 PROBE_NAMESPACE = "ytpipe-broker-probe-v1"
 SYNTHETIC_TRANSCRIPT = "La energía solar convierte la luz del sol en electricidad limpia y renovable."
-SYNTHETIC_PROMPT = "Resume este texto en español con el formato exacto solicitado."
-SYNTHETIC_SYSTEM_PROMPT = "Eres un resumidor fiel. Responde solo con el formato solicitado."
+SYNTHETIC_PROMPT = FINAL_SUMMARY_INSTRUCTIONS + "\n\nTRANSCRIPCION:\n\n" + SYNTHETIC_TRANSCRIPT
+SYNTHETIC_SYSTEM_PROMPT = SUMMARIZATION_SYSTEM_PROMPT
 SYNTHETIC_MAX_TOKENS = 512
 
 
@@ -52,7 +52,7 @@ class BrokerProbeService:
     def synthetic(self, probe_id: str | None = None) -> BrokerProbeResult:
         self._last_summary = None
         pid = self._probe_id(probe_id)
-        operation = BrokerOperation("synthetic", 0, SYNTHETIC_SYSTEM_PROMPT, SYNTHETIC_PROMPT + "\n\n" + SYNTHETIC_TRANSCRIPT,
+        operation = BrokerOperation("synthetic", 0, SYNTHETIC_SYSTEM_PROMPT, SYNTHETIC_PROMPT,
                                     SYNTHETIC_MAX_TOKENS)
         try:
             summary = self._client.submit(operation, probe_idempotency_key("synthetic", pid, "submit", 0))
