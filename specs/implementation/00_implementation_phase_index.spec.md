@@ -49,9 +49,9 @@ is `specs/telegram_summary_commands.spec.md`.
 1. `12A_telegram_command_intake.spec.md` - Add disabled-by-default settings, strict URL parsing, durable command-request schema, canonical metadata boundary, and internal intake API without processing content.
 2. `12B_telegram_command_processing.spec.md` - Add durable claiming/recovery, content-only pipeline reuse, cached-summary behavior, retries, and request-specific Telegram replies without the long-poll listener.
 3. `12C_telegram_long_polling_operations.spec.md` - Add the single-consumer long-poll listener, worker trigger loop, systemd operation, rollout, observability, and end-to-end verification.
-4. `Y00_broker_gateway_offline.spec.md` - Post-MVP offline gateway/adaptor seam. Status: implemented and accepted at commit `ff05558`; no production deployment is claimed. It retains direct-only runtime composition, exact direct behavior, dormant/test-injected broker behavior, recovery target `none`, stable per-operation idempotency, broker-only validation, and fully offline tests.
-5. `Y01_broker_safe_connectivity_acceptance.spec.md` - Status: `draft_pending_human_approval`; no execution authorization. Safe connectivity/manual acceptance only: it owns probe configuration, explicit synthetic and one-off user-approved URL tests, strict isolation, and rollback.
-6. `Y02` - Future and unapproved: production routing selection/canary, durable terminal reconciliation/generation policy, cancellation, and load/distributed exclusivity.
+4. `Y00_broker_gateway_offline.spec.md` - Status: `accepted` at commit `ff05558`; no production deployment is claimed. It retains direct-only runtime composition, exact direct behavior, dormant/test-injected broker behavior, recovery target `none`, stable per-operation idempotency, broker-only validation, and fully offline tests.
+5. `Y01_broker_safe_connectivity_acceptance.spec.md` - Status: `implemented_offline_verified_acceptance_blocked_on_H03`. Implementation and offline review exist and manual synthetic connectivity succeeded. Final acceptance still requires broker H03 plus the controlled real-URL gate. Y01 is connectivity acceptance only, not product broker activation; direct normal composition remains unchanged. YTPipe baseline `8ae6aa5` is context, not Y01 acceptance.
+6. `Y02` - Status: `future` / `deferred` / `unapproved`. It may later own production routing selection/canary, durable terminal reconciliation/generation policy, cancellation, and load/distributed exclusivity, but none is currently authorized.
 
 Phase 12C status: completed after automated and operator end-to-end
 verification. The listener unit remains available for explicit host rollout.
@@ -75,6 +75,12 @@ verification. The listener unit remains available for explicit host rollout.
   not access application persistence or content services directly.
 - Phases 12A, 12B, and 12C must be implemented and reviewed sequentially; human
   approval is required before advancing to the next phase.
+- Y01 depends on accepted Y00. Existing implementation/offline review and the
+  successful synthetic do not complete Y01 acceptance: accepted/implemented
+  broker H03, compatibility desired/effective PASS, and the separately approved
+  one-URL acceptance gate are prerequisites.
+- Y01 does not activate normal broker routing. Y02 remains deferred and requires
+  a new approved specification after Y01 acceptance.
 
 ## Risks
 - OAuth token handling can fail if refresh behavior is not treated as a strict persistence contract.

@@ -180,7 +180,10 @@ def test_broker_valid_terminal_errors_are_sanitized(state: str) -> None:
     def handler(request: httpx.Request):
         if request.method == "POST":
             return response(202, json=task("t"), headers={"Location": "/v1/tasks/t"})
-        return response(200, json={"status": state, "error": error})
+        payload = {"status": state}
+        if state == "failed":
+            payload["error"] = error
+        return response(200, json=payload)
 
     svc = gateway(handler)
     try:

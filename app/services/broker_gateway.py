@@ -4,6 +4,7 @@ import math
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -11,6 +12,7 @@ import httpx
 
 from app.services.broker_errors import broker_error
 from app.services.broker_summary import validate_broker_output
+from app.services.broker_profile import BrokerRequestProfile
 from app.services.summarization_gateway import SummaryGatewayContext, SummaryOperation, idempotency_key
 from app.services.summarization_planner import plan_operations
 
@@ -18,27 +20,37 @@ from app.services.summarization_planner import plan_operations
 BrokerOperation = SummaryOperation
 
 
+@dataclass(frozen=True, slots=True)
+class BrokerResult:
+    content: str
+    finish_reason: str
+    usage: dict[str, int]
+
+
 class BrokerTaskClient:
     """Reusable B00 task protocol client for non-pipeline callers."""
 
     def __init__(self, *, base_url: str, credential: str, transport: httpx.BaseTransport,
-                 timeout: float, monotonic: Callable[[], float] = time.monotonic,
+                 timeout: float, profile: BrokerRequestProfile | None = None,
+                 monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep):
         self._gateway = BrokerSummarizationGateway(
             base_url=base_url, credential=credential, transport=transport,
-            timeout=timeout, monotonic=monotonic, sleep=sleep,
+            timeout=timeout, profile=profile, monotonic=monotonic, sleep=sleep,
         )
 
     @classmethod
     def from_client(cls, client: httpx.Client, *, timeout: float,
+                    profile: BrokerRequestProfile | None = None,
                     monotonic: Callable[[], float] = time.monotonic,
                     sleep: Callable[[float], None] = time.sleep) -> "BrokerTaskClient":
         instance = cls.__new__(cls)
         gateway = BrokerSummarizationGateway.__new__(BrokerSummarizationGateway)
         gateway._base_url = str(client.base_url).rstrip("/")
         gateway._credential = ""
-        gateway._timeout = min(float(timeout), 300.0)
+        gateway._timeout = min(float(timeout), 360.0)
         gateway._max_tokens = 0
+        gateway._profile = profile
         gateway._clock = monotonic
         gateway._sleep = sleep
         gateway._client = client
@@ -51,17 +63,22 @@ class BrokerTaskClient:
     def submit(self, operation: BrokerOperation, idempotency_key_value: str) -> str:
         return self._gateway._submit_with_key(operation, idempotency_key_value)
 
+    def submit_result(self, operation: BrokerOperation, idempotency_key_value: str) -> BrokerResult:
+        return self._gateway._submit_result_with_key(operation, idempotency_key_value)
+
 
 class BrokerSummarizationGateway:
     """Dormant B00 client. Construction requires an explicitly injected transport."""
 
     def __init__(self, *, base_url: str, credential: str, transport: httpx.BaseTransport,
-                 timeout: float, max_tokens: int = 0, monotonic: Callable[[], float] = time.monotonic,
+                 timeout: float, max_tokens: int = 0, profile: BrokerRequestProfile | None = None,
+                 monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep):
         self._base_url = base_url.rstrip("/")
         self._credential = credential
-        self._timeout = min(float(timeout), 300.0)
+        self._timeout = min(float(timeout), 360.0)
         self._max_tokens = max_tokens
+        self._profile = profile
         self._clock = monotonic
         self._sleep = sleep
         self._client = httpx.Client(base_url=self._base_url, transport=transport, follow_redirects=False, trust_env=False)
@@ -90,21 +107,29 @@ class BrokerSummarizationGateway:
         return self._submit_with_key(operation, key)
 
     def _submit_with_key(self, operation: SummaryOperation, key: str) -> str:
+        result = self._submit_result_with_key(operation, key)
+        try:
+            return validate_broker_output(result.content)
+        except ValueError:
+            raise broker_error("broker_output_invalid") from None
+
+    def _submit_result_with_key(self, operation: SummaryOperation, key: str) -> BrokerResult:
+        profile = self._profile
         generation: dict[str, object] = {
             "max_tokens": operation.max_tokens,
-            "temperature": 0.7,
+            "temperature": profile.temperature if profile is not None else 0.7,
         }
         if operation.stop:
             generation["stop"] = list(operation.stop)
         body = {
-            "workload": "batch-summary",
-            "capability": "summarize",
+            "workload": profile.workload if profile is not None else "batch-summary",
+            "capability": profile.capability if profile is not None else "summarize",
             "messages": [
                 {"role": "system", "content": operation.system_prompt},
                 {"role": "user", "content": operation.user_prompt},
             ],
             "generation": generation,
-            "response": {"kind": "text"},
+            "response": {"kind": profile.response_kind if profile is not None else "text"},
         }
         deadline = self._clock() + self._timeout
         remaining = deadline - self._clock()
@@ -162,7 +187,7 @@ class BrokerSummarizationGateway:
         return self._client.request(method, path, headers=headers, json=json, timeout=timeout or self._timeout)
 
     @staticmethod
-    def _validated_result(response: httpx.Response) -> str:
+    def _validated_result(response: httpx.Response) -> BrokerResult:
         payload = _json_dict(response)
         if set(payload) != {"status", "result"} or payload.get("status") != "succeeded":
             raise broker_error("broker_protocol_error")
@@ -174,10 +199,8 @@ class BrokerSummarizationGateway:
             "stop", "length", "content_filter", "unknown"
         } or not _valid_usage(result.get("usage")):
             raise broker_error("broker_protocol_error")
-        try:
-            return validate_broker_output(text)
-        except ValueError:
-            raise broker_error("broker_output_invalid") from None
+        usage = result["usage"]
+        return BrokerResult(text, result["finish_reason"], usage)
 
     def _location_id(self, response: httpx.Response) -> str:
         location = response.headers.get("Location")
@@ -259,10 +282,13 @@ def _task_result_status(response: httpx.Response) -> str:
     elif state == "pending":
         if set(payload) != {"status"}:
             raise broker_error("broker_protocol_error")
-    elif state in {"failed", "cancelled", "expired"}:
+    elif state == "failed":
         if set(payload) != {"status", "error"}:
             raise broker_error("broker_protocol_error")
         _validate_classified_error(payload["error"])
+    elif state in {"cancelled", "expired"}:
+        if set(payload) != {"status"}:
+            raise broker_error("broker_protocol_error")
     else:
         raise broker_error("broker_protocol_error")
     return state
@@ -286,6 +312,7 @@ def _validate_classified_error(value: object) -> None:
         "transient_unsent",
         "transient_safe",
         "indeterminate",
+        "internal",
     }:
         raise broker_error("broker_protocol_error")
 
