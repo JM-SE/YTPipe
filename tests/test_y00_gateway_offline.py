@@ -192,6 +192,18 @@ def test_broker_valid_terminal_errors_are_sanitized(state: str) -> None:
         svc.close()
 
 
+def test_broker_synchronous_terminal_failure_uses_result_envelope() -> None:
+    error = {"class": "backend_rejected", "code": "backend_rejected", "message": "safe"}
+    svc = gateway(lambda request: response(200, json={"status": "failed", "error": error}))
+    try:
+        with pytest.raises(BrokerSummarizationError) as exc:
+            svc.summarize("short", context=SummaryGatewayContext(1))
+        assert exc.value.code == "broker_task_failed"
+        assert str(exc.value) == "Broker summarization failed."
+    finally:
+        svc.close()
+
+
 @pytest.mark.parametrize("value", [
     "", "  ", "a <think>x", "a </THINK>",
     "RESUMEN\nR\nPUNTOS CLAVE\n• a\n• b\n• c\nCONCLUSIÓN\nC",  # 3 bullets

@@ -118,7 +118,12 @@ class BrokerSummarizationGateway:
         if deadline - self._clock() <= 0:
             raise broker_error("broker_timeout")
         if response.status_code == 200:
-            return self._validated_result(response)
+            state = _task_result_status(response)
+            if state == "succeeded":
+                return self._validated_result(response)
+            if state in {"failed", "cancelled", "expired"}:
+                raise broker_error(f"broker_task_{state}")
+            raise broker_error("broker_protocol_error")
         if response.status_code not in (201, 202):
             raise broker_error(_problem_code(response))
         task_id = self._location_id(response)
