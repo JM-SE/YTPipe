@@ -79,7 +79,9 @@ class BrokerProbeService:
         self._last_summary = None
         pid = self._probe_id(probe_id)
         fetched = transcript_service.fetch_transcript_result(parsed_url.video_id)
-        if not fetched.completed or not fetched.text:
+        if fetched.outcome == "retryable":
+            return BrokerProbeResult("failed", "transcript_retryable")
+        if fetched.outcome != "completed" or not fetched.text:
             return BrokerProbeResult("failed", "transcript_unavailable")
         if len(fetched.text) > self._cap:
             return BrokerProbeResult("failed", "transcript_too_large")

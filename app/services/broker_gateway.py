@@ -291,7 +291,11 @@ def _problem_code(response: httpx.Response) -> str:
     except ValueError:
         return "broker_protocol_error"
     if isinstance(payload, dict) and isinstance(payload.get("code"), str):
-        return {"unauthorized": "broker_unauthorized", "invalid_request": "broker_invalid_request"}.get(
+        return {
+            "unauthorized": "broker_unauthorized",
+            "invalid_request": "broker_invalid_request",
+            "unprocessable": "broker_invalid_request",
+        }.get(
             payload["code"], "broker_protocol_error"
         )
     return "broker_protocol_error"

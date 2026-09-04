@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from youtube_transcript_api import YouTubeTranscriptApi
 
 from app.cli import broker_probe as cli
 from app.core.settings import Settings
@@ -97,6 +98,10 @@ def test_probe_configuration_is_inert_when_flags_are_disabled() -> None:
     assert settings.llama_cpp_base_url == "http://127.0.0.1:8001/v1"
 
 
+def test_transcript_dependency_exposes_v1_fetch_contract() -> None:
+    assert callable(getattr(YouTubeTranscriptApi, "fetch", None))
+
+
 def test_local_probe_still_rejects_non_loopback_http() -> None:
     settings = Settings(
         app_env="local",
@@ -147,6 +152,15 @@ def test_synthetic_probe_reports_output_validation_separately() -> None:
     try:
         result = BrokerProbeService(client).synthetic("probe-invalid-output")
         assert result == type(result)("failed", "broker_output_invalid")
+    finally:
+        client.close()
+
+
+def test_broker_unprocessable_is_reported_as_safe_invalid_request() -> None:
+    client = _client(lambda request: _response(422, {"code": "unprocessable", "detail": "private"}, request))
+    try:
+        result = BrokerProbeService(client).synthetic("probe-unprocessable")
+        assert result == type(result)("failed", "broker_invalid_request")
     finally:
         client.close()
 
@@ -284,6 +298,35 @@ def test_youtube_probe_rejects_oversized_transcript_before_submit() -> None:
         service = BrokerProbeService(client, max_transcript_characters=10)
         result = service.youtube(parse_youtube_video_url("https://youtu.be/abcdefghijk"), Transcript())
         assert result == type(result)("failed", "transcript_too_large")
+        assert called is False
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [("unavailable", "transcript_unavailable"), ("retryable", "transcript_retryable")],
+)
+def test_youtube_probe_distinguishes_unavailable_from_retryable_transcript(
+    outcome: str, expected: str,
+) -> None:
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return _response(200, _result(), request)
+
+    class Transcript:
+        def fetch_transcript_result(self, video_id: str) -> TranscriptFetchResult:
+            return TranscriptFetchResult(None, outcome, "implementation detail")
+
+    client = _client(handler)
+    try:
+        result = BrokerProbeService(client).youtube(
+            parse_youtube_video_url("https://youtu.be/abcdefghijk"), Transcript(), "probe-transcript",
+        )
+        assert result == type(result)("failed", expected)
         assert called is False
     finally:
         client.close()
