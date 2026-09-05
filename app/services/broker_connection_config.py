@@ -14,6 +14,8 @@ class BrokerConfigurationError(ValueError):
 
 
 MAX_BROKER_PROBE_TRANSCRIPT_CHARACTERS = 1_000_000
+DEFAULT_BROKER_PROBE_TIMEOUT_SECONDS = 360.0
+MAX_BROKER_PROBE_TIMEOUT_SECONDS = 360.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,9 +60,9 @@ def broker_connection_config(settings: Settings) -> BrokerConnectionConfig:
         raise BrokerConfigurationError("Broker probe base URL must use HTTPS.")
     timeout = settings.broker_timeout_seconds
     if timeout is None:
-        timeout = settings.llama_cpp_timeout
-    if not 1 <= float(timeout) <= 300:
-        raise BrokerConfigurationError("Broker probe timeout must be between 1 and 300 seconds.")
+        timeout = DEFAULT_BROKER_PROBE_TIMEOUT_SECONDS
+    if not 1 <= float(timeout) <= MAX_BROKER_PROBE_TIMEOUT_SECONDS:
+        raise BrokerConfigurationError("Broker probe timeout must be between 1 and 360 seconds.")
     return BrokerConnectionConfig(base.rstrip("/"), token, float(timeout))
 
 

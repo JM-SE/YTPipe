@@ -10,6 +10,7 @@ from app.core.settings import Settings
 from app.services.broker_connection_config import BrokerConfigurationError, broker_connection_config, build_broker_client
 from app.services.broker_gateway import BrokerTaskClient
 from app.services.broker_probe import BrokerProbeService
+from app.services.broker_profile import load_y01_profile
 from app.services.transcript import TranscriptService
 from app.services.youtube_video_url import YouTubeURLValidationError, parse_youtube_video_url
 
@@ -22,7 +23,6 @@ def main(argv: Sequence[str] | None = None, *, settings: Settings | None = None,
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(prog="broker-probe")
     parser.add_argument("--youtube", action="store_true", help="run the interactive YouTube acceptance probe")
-    parser.add_argument("--show-summary", action="store_true", help="display accepted output in the terminal")
     parser.add_argument("--probe-id", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     stdin, stdout, stderr = stdin or sys.stdin, stdout or sys.stdout, stderr or sys.stderr
@@ -34,14 +34,16 @@ def main(argv: Sequence[str] | None = None, *, settings: Settings | None = None,
         stderr.write("Broker probe is disabled.\n")
         return 2
     try:
+        profile = load_y01_profile()
         config = broker_connection_config(settings)
-    except BrokerConfigurationError:
+    except (BrokerConfigurationError, ValueError):
         stderr.write("Broker probe configuration is invalid.\n")
         return 2
     client = build_broker_client(config)
-    task_client = BrokerTaskClient.from_client(client, timeout=config.timeout_seconds)
+    task_client = BrokerTaskClient.from_client(client, timeout=config.timeout_seconds, profile=profile)
     try:
-        service = BrokerProbeService(task_client, max_transcript_characters=settings.broker_probe_max_transcript_characters)
+        service = BrokerProbeService(task_client, profile=profile,
+                                     max_transcript_characters=settings.broker_probe_max_transcript_characters)
         if args.youtube:
             stdout.write("Enter a YouTube video URL: ")
             raw_url = stdin.readline()
@@ -72,10 +74,6 @@ def main(argv: Sequence[str] | None = None, *, settings: Settings | None = None,
                 stderr.write("Probe ID is invalid.\n")
                 return 2
         stdout.write(f"Probe {result.status}: {result.category}\n")
-        if args.show_summary:
-            stdout.write("Warning: the result may enter terminal scrollback.\n")
-            if service.summary_for_display is not None:
-                stdout.write(service.summary_for_display + "\n")
         return 0 if result.status == "succeeded" else 1
     finally:
         task_client.close()

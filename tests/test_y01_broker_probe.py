@@ -9,6 +9,7 @@ from app.core.settings import Settings
 from app.services.broker_connection_config import BrokerConfigurationError, broker_connection_config
 from app.services.broker_probe import BrokerProbeService, probe_idempotency_key
 from app.services.broker_gateway import BrokerTaskClient
+from app.services.broker_profile import load_y01_profile
 from app.services.transcript import TranscriptFetchResult
 from app.services.youtube_video_url import parse_youtube_video_url
 
@@ -53,7 +54,7 @@ def _result() -> dict:
     }
 
 
-def _client(handler, *, now=None, sleep=None) -> BrokerTaskClient:
+def _client(handler, *, now=None, sleep=None, profile=None) -> BrokerTaskClient:
     client = httpx.Client(
         base_url="https://broker.example.test",
         transport=httpx.MockTransport(handler),
@@ -63,6 +64,7 @@ def _client(handler, *, now=None, sleep=None) -> BrokerTaskClient:
     return BrokerTaskClient.from_client(
         client,
         timeout=10,
+        profile=profile or load_y01_profile(),
         monotonic=now or (lambda: 0.0),
         sleep=sleep or (lambda _: None),
     )
@@ -119,6 +121,30 @@ def test_probe_idempotency_is_namespaced_and_stable() -> None:
     assert len(first) == 64
 
 
+def test_y01_profile_is_strict_and_single_source_for_probe_contract() -> None:
+    profile = load_y01_profile()
+    assert profile.workload == "batch-summary"
+    assert profile.capability == "summarize"
+    assert profile.max_tokens == 1024
+    assert profile.temperature == 0.7
+    assert profile.required_min_output_bytes == 16384
+    assert profile.max_request_content_bytes == 131072
+    assert profile.min_backend_response_start_timeout_seconds == 60
+    assert profile.min_workload_timeout_seconds == 300
+    assert profile.max_acceptable_attempts == 1
+    assert profile.consumer_overall_deadline_seconds == 360
+    # Golden digest: the broker `llm-broker compat` CLI computes the identical
+    # semantic digest from this manifest (H03 cross-language contract).
+    assert profile.digest == "sha256:60450bde099909b93a79deb03d07576b47b8282c0e0a4ded91aa56dd1a61615e"
+
+
+def test_y01_profile_rejects_duplicate_keys(tmp_path) -> None:
+    path = tmp_path / "profile.json"
+    path.write_text('{"version":"consumer-compat/v1","version":"consumer-compat/v1"}')
+    with pytest.raises(ValueError, match="profile is invalid"):
+        load_y01_profile(path)
+
+
 def test_synthetic_probe_uses_fixed_payload_and_returns_sanitized_result() -> None:
     requests: list[httpx.Request] = []
 
@@ -138,6 +164,7 @@ def test_synthetic_probe_uses_fixed_payload_and_returns_sanitized_result() -> No
         assert body["capability"] == "summarize"
         assert "paneles solares" in body["messages"][1]["content"]
         assert "Authorization" not in body["messages"][1]["content"]
+        assert body["generation"]["max_tokens"] == 1024
     finally:
         client.close()
 
@@ -221,6 +248,20 @@ def test_async_probe_rejects_malformed_terminal_envelope() -> None:
         client.close()
 
 
+def test_probe_maps_length_finish_reason_to_incomplete() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        result = _result()
+        result["result"]["finish_reason"] = "length"
+        return _response(200, result, request)
+
+    client = _client(handler)
+    try:
+        result = BrokerProbeService(client).synthetic("probe-length")
+        assert result == type(result)("failed", "broker_output_incomplete")
+    finally:
+        client.close()
+
+
 class _FakeTTY:
     def __init__(self, value: str = "") -> None:
         self.value = value
@@ -281,6 +322,18 @@ def test_cli_default_output_does_not_include_summary(monkeypatch: pytest.MonkeyP
     assert "Probe succeeded: synthetic_accepted" in stdout.output
 
 
+def test_cli_exposes_no_content_display_flag() -> None:
+    # F7 acceptance pin: no --show-summary flag may exist, and no accepted
+    # output may reach a terminal through the CLI even with the last summary
+    # accepted. The parser help output is the stable contract surface.
+    help_out, help_err = _FakeTTY(), _FakeTTY()
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--help"], settings=Settings(), stdin=_FakeTTY(), stdout=help_out, stderr=help_err)
+    assert exc.value.code == 0
+    assert "--show-summary" not in help_out.output
+    assert "--show-summary" not in help_err.output
+
+
 def test_youtube_probe_rejects_oversized_transcript_before_submit() -> None:
     called = False
 
@@ -328,6 +381,30 @@ def test_youtube_probe_distinguishes_unavailable_from_retryable_transcript(
         )
         assert result == type(result)("failed", expected)
         assert called is False
+    finally:
+        client.close()
+
+
+def test_synthetic_probe_rejects_oversized_request_without_submit() -> None:
+    import dataclasses
+
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return _response(200, _result(), request)
+
+    profile = dataclasses.replace(load_y01_profile(), max_request_content_bytes=10)
+    client = _client(handler, profile=profile)
+    try:
+        service = BrokerProbeService(
+            client, profile=profile, probe_id_factory=lambda: "probe-input-cap",
+        )
+        result = service.synthetic()
+        assert result == type(result)("failed", "broker_input_too_large")
+        assert called is False
+        assert service.summary_for_display is None
     finally:
         client.close()
 
