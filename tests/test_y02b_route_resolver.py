@@ -311,6 +311,8 @@ def test_pipeline_logs_per_summary_attribution_direct(caplog: pytest.LogCaptureF
     assert "route=direct" in records[0].getMessage()
     assert "stage_id=7" in records[0].getMessage()
     assert "video_id=11" in records[0].getMessage()
+    failed = [r for r in caplog.records if "summary_failed" in r.getMessage()]
+    assert failed == []
 
 
 def test_pipeline_logs_per_summary_attribution_broker(caplog: pytest.LogCaptureFixture) -> None:
@@ -331,6 +333,8 @@ def test_pipeline_logs_per_summary_attribution_broker(caplog: pytest.LogCaptureF
     assert "route=broker" in records[0].getMessage()
     assert "stage_id=7" in records[0].getMessage()
     assert "video_id=11" in records[0].getMessage()
+    failed = [r for r in caplog.records if "summary_failed" in r.getMessage()]
+    assert failed == []
 
 
 def test_route_name_query_is_attribution_only() -> None:
@@ -410,3 +414,105 @@ def test_plain_exception_defaults_none_on_broker_route(caplog: pytest.LogCapture
     records = [r for r in caplog.records if "summary_route_attributed" in r.getMessage()]
     assert len(records) == 1
     assert "route=broker" in records[0].getMessage()
+
+
+def test_direct_failure_logs_sanitized_code(caplog: pytest.LogCaptureFixture) -> None:
+    service = PipelineService(summarization_service=_BoomDirectService())  # type: ignore[arg-type]
+    stage, video, session = _fake_stage_video()
+    with caplog.at_level(logging.INFO, logger="app.services.pipeline"):
+        assert service._attempt_summary_stage(session, stage, video) is True
+    assert stage.status == STATUS_PENDING_RETRY
+    records = [r for r in caplog.records if "summary_failed" in r.getMessage()]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "code=direct_error" in message
+    assert "route=direct" in message
+    assert "direct boom" not in message
+    assert "direct boom" not in caplog.text
+    attributed = [r for r in caplog.records if "summary_route_attributed" in r.getMessage()]
+    assert len(attributed) == 1
+    assert "route=direct" in attributed[0].getMessage()
+    assert "stage_id=7" in attributed[0].getMessage()
+    assert "video_id=11" in attributed[0].getMessage()
+
+
+def test_broker_classified_failure_logs_its_code(caplog: pytest.LogCaptureFixture) -> None:
+    service = _traffic_service(lambda request: _response(200, _succeeded_result()))
+    try:
+        def _boom(transcript: str, *, context: SummaryGatewayContext | None = None) -> str:
+            raise BrokerSummarizationError("broker_output_incomplete")
+
+        service.summarize = _boom  # type: ignore[method-assign]
+        pipeline = PipelineService(summarization_service=service)  # type: ignore[arg-type]
+        stage, video, session = _fake_stage_video()
+        with caplog.at_level(logging.INFO, logger="app.services.pipeline"):
+            assert pipeline._attempt_summary_stage(session, stage, video) is True
+    finally:
+        service.close()
+    assert stage.status == STATUS_PENDING_RETRY
+    records = [r for r in caplog.records if "summary_failed" in r.getMessage()]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "code=broker_output_incomplete" in message
+    assert "route=broker" in message
+    attributed = [r for r in caplog.records if "summary_route_attributed" in r.getMessage()]
+    assert len(attributed) == 1
+    assert "route=broker" in attributed[0].getMessage()
+    assert "stage_id=7" in attributed[0].getMessage()
+    assert "video_id=11" in attributed[0].getMessage()
+
+
+def test_broker_unclassified_failure_logs_unknown_without_detail(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = _traffic_service(lambda request: _response(200, _succeeded_result()))
+    try:
+        def _boom(transcript: str, *, context: SummaryGatewayContext | None = None) -> str:
+            raise ValueError("raw transport detail")
+
+        service.summarize = _boom  # type: ignore[method-assign]
+        pipeline = PipelineService(summarization_service=service)  # type: ignore[arg-type]
+        stage, video, session = _fake_stage_video()
+        with caplog.at_level(logging.INFO, logger="app.services.pipeline"):
+            assert pipeline._attempt_summary_stage(session, stage, video) is True
+    finally:
+        service.close()
+    records = [r for r in caplog.records if "summary_failed" in r.getMessage()]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "code=broker_unknown" in message
+    assert "route=broker" in message
+    assert "raw transport detail" not in message
+    assert "raw transport detail" not in caplog.text
+    attributed = [r for r in caplog.records if "summary_route_attributed" in r.getMessage()]
+    assert len(attributed) == 1
+    assert "route=broker" in attributed[0].getMessage()
+    assert "stage_id=7" in attributed[0].getMessage()
+    assert "video_id=11" in attributed[0].getMessage()
+
+
+def test_broker_length_finish_maps_incomplete_end_to_end(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _response(200, _succeeded_result(finish_reason="length"))
+
+    service = _traffic_service(handler)
+    try:
+        pipeline = PipelineService(summarization_service=service)  # type: ignore[arg-type]
+        stage, video, session = _fake_stage_video()
+        with caplog.at_level(logging.INFO, logger="app.services.pipeline"):
+            assert pipeline._attempt_summary_stage(session, stage, video) is True
+    finally:
+        service.close()
+    assert stage.status == STATUS_PENDING_RETRY
+    records = [r for r in caplog.records if "summary_failed" in r.getMessage()]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "code=broker_output_incomplete" in message
+    assert "route=broker" in message
+    attributed = [r for r in caplog.records if "summary_route_attributed" in r.getMessage()]
+    assert len(attributed) == 1
+    assert "route=broker" in attributed[0].getMessage()
+    assert "stage_id=7" in attributed[0].getMessage()
+    assert "video_id=11" in attributed[0].getMessage()

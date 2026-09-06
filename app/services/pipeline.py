@@ -716,6 +716,7 @@ class PipelineService:
         stage.attempt_count += 1
         stage.last_attempt_at = attempted_at
 
+        route = summarization_route_name(self.summarization_service)
         try:
             # Per-summarization route attribution for Y02 one-to-one
             # reconciliation: route plus stage/video identifiers only, logged
@@ -723,7 +724,7 @@ class PipelineService:
             # or broker topology.
             logger.info(
                 "summary_route_attributed route=%s stage_id=%s video_id=%s",
-                summarization_route_name(self.summarization_service),
+                route,
                 stage.id,
                 video.id,
             )
@@ -748,6 +749,20 @@ class PipelineService:
             recovery_target = getattr(exc, "recovery_target", default_target)
             if recovery_target not in {"direct_llama", "none"}:
                 recovery_target = "direct_llama"
+            # Sanitized failure code for canary observability: stable
+            # machine-safe category only (never content/credentials). Count
+            # these records against summary_route_attributed to measure the
+            # frozen abort thresholds (e.g. >20% broker_output_incomplete).
+            failure_code = getattr(exc, "code", None)
+            if failure_code is None:
+                failure_code = "broker_unknown" if route == "broker" else "direct_error"
+            logger.info(
+                "summary_failed code=%s route=%s stage_id=%s video_id=%s",
+                failure_code,
+                route,
+                stage.id,
+                video.id,
+            )
             self.summary_paused = True
             self.summary_pause_reason = stage.last_error
             self.summary_pause_video_id = video.id

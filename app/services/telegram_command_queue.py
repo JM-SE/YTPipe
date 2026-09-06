@@ -310,6 +310,12 @@ class TelegramCommandQueueService:
             self._finish_processing(request, token, "completed", None)
             return
 
+        # NOTE (Y02b): the build sits before `try` on purpose. If routed-gateway
+        # construction fails (fail-closed on invalid broker config), the error
+        # bubbles without `_finish_processing`, so the request keeps its
+        # `processing` lease until LEASE_SECONDS expiry instead of landing in
+        # `failed`/`pending_retry`. Intended trade-off: never fall back to
+        # direct inference; do not "fix" by catching and rerouting.
         pipeline = self._build_pipeline(user, video)
         try:
             content_result = pipeline.process_content_stages(self.session, user, video)
