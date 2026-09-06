@@ -29,7 +29,7 @@ from app.models.user import User
 from app.services.pipeline import PipelineService
 from app.services.execution_lock import ExecutionLockBusy, acquire_execution_lock
 from app.services.polling import SUMMARIZATION_PROCESS
-from app.services.direct_summarization import build_summarization_gateway
+from app.services.summary_route import build_routed_summarization_gateway, close_routed_summarization_gateway
 from app.services.telegram import TelegramDeliveryService
 from app.services.transcript import TranscriptService
 
@@ -165,11 +165,12 @@ def _process_pending_pipeline_startup(settings: Settings) -> None:
             and (summarization_state.state_metadata or {}).get("paused", False)
         )
 
+        summarization_gateway = build_routed_summarization_gateway(settings, root="startup")
         try:
             with acquire_execution_lock(session):
                 pipeline_service = PipelineService(
                     transcript_service=TranscriptService(settings),
-                    summarization_service=build_summarization_gateway(settings),
+                    summarization_service=summarization_gateway,
                     telegram_service=TelegramDeliveryService(settings),
                     startup_batch_size=settings.pipeline_startup_batch_size,
                     startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
@@ -182,6 +183,8 @@ def _process_pending_pipeline_startup(settings: Settings) -> None:
         except ExecutionLockBusy:
             logger.info("Startup pipeline processing skipped: shared execution lock is busy.")
             return
+        finally:
+            close_routed_summarization_gateway(summarization_gateway)
 
         logger.info(
             "Startup pipeline processing complete: "

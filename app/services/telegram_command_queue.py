@@ -18,7 +18,7 @@ from app.services.auth import GOOGLE_PROVIDER, GoogleOAuthService
 from app.services.execution_lock import acquire_execution_lock
 from app.services.llama_recovery import LlamaRecoveryService
 from app.services.pipeline import PipelineService
-from app.services.direct_summarization import build_summarization_gateway
+from app.services.summary_route import build_routed_summarization_gateway, close_routed_summarization_gateway
 from app.services.telegram import TelegramDeliveryAttemptError, TelegramDeliveryService
 from app.services.transcript import TranscriptService
 from app.services.youtube_video_metadata import YouTubeMetadataError, YouTubeVideoMetadataService
@@ -311,21 +311,24 @@ class TelegramCommandQueueService:
             return
 
         pipeline = self._build_pipeline(user, video)
-        content_result = pipeline.process_content_stages(self.session, user, video)
-        if content_result.outcome == "completed":
-            self._finish_processing(request, token, "completed", None)
-        elif content_result.outcome == "failed":
-            self._finish_processing(request, token, "failed", content_result.error)
-        else:
-            if pipeline.summary_paused and getattr(pipeline, "_summary_recovery_target", "direct_llama") != "none":
-                self._attempt_llama_recovery(user.id)
-            self._finish_processing(
-                request,
-                token,
-                "pending_retry",
-                content_result.error or "Content processing is temporarily pending.",
-                delay_seconds=300 if pipeline.summary_paused else 30,
-            )
+        try:
+            content_result = pipeline.process_content_stages(self.session, user, video)
+            if content_result.outcome == "completed":
+                self._finish_processing(request, token, "completed", None)
+            elif content_result.outcome == "failed":
+                self._finish_processing(request, token, "failed", content_result.error)
+            else:
+                if pipeline.summary_paused and getattr(pipeline, "_summary_recovery_target", "direct_llama") != "none":
+                    self._attempt_llama_recovery(user.id)
+                self._finish_processing(
+                    request,
+                    token,
+                    "pending_retry",
+                    content_result.error or "Content processing is temporarily pending.",
+                    delay_seconds=300 if pipeline.summary_paused else 30,
+                )
+        finally:
+            close_routed_summarization_gateway(pipeline.summarization_service)
 
     def _deliver_reply(self, request_id: int, token: str) -> None:
         request = self.session.get(TelegramCommandRequest, request_id)
@@ -484,7 +487,7 @@ class TelegramCommandQueueService:
         )
         pipeline = PipelineService(
             transcript_service=TranscriptService(self.settings),
-            summarization_service=build_summarization_gateway(self.settings),
+            summarization_service=build_routed_summarization_gateway(self.settings, root="telegram"),
             startup_batch_size=0,
             summary_paused=summary_paused,
             shorts_processing_enabled=self.settings.shorts_processing_enabled,

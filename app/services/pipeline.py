@@ -15,10 +15,10 @@ from app.models.pipeline_stage import PipelineStage
 from app.models.sync_state import SyncState
 from app.models.user import User
 from app.models.video import Video
-from app.services.summarization import SummarizationService
 from app.services.telegram import TelegramDeliveryAttemptError, TelegramDeliveryService, TelegramNotificationPayload
 from app.services.transcript import TranscriptService
-from app.services.summarization_gateway import SummaryGatewayContext
+from app.services.summarization_gateway import SummarizationGateway, SummaryGatewayContext
+from app.services.summary_route import summarization_route_name
 
 logger = logging.getLogger(__name__)
 _SUMMARY_INFERENCE_LOCK = threading.Lock()
@@ -86,7 +86,7 @@ class PipelineService:
     def __init__(
         self,
         transcript_service: TranscriptService | None = None,
-        summarization_service: SummarizationService | None = None,
+        summarization_service: SummarizationGateway | None = None,
         telegram_service: TelegramDeliveryService | None = None,
         startup_batch_size: int = 0,
         startup_batch_delay_seconds: float = 30.0,
@@ -717,6 +717,16 @@ class PipelineService:
         stage.last_attempt_at = attempted_at
 
         try:
+            # Per-summarization route attribution for Y02 one-to-one
+            # reconciliation: route plus stage/video identifiers only, logged
+            # once per inference attempt. No prompts, content, credentials,
+            # or broker topology.
+            logger.info(
+                "summary_route_attributed route=%s stage_id=%s video_id=%s",
+                summarization_route_name(self.summarization_service),
+                stage.id,
+                video.id,
+            )
             # llama.cpp runs on the local homelab GPU. Keep every entrypoint to
             # the model serialized, including retries and incident recovery.
             with _SUMMARY_INFERENCE_LOCK:
@@ -726,7 +736,16 @@ class PipelineService:
         except Exception as exc:
             summary = None
             stage.last_error = _compact_error(str(exc))
-            recovery_target = getattr(exc, "recovery_target", "direct_llama")
+            # Route-aware default: an exception without an explicit target must
+            # not trigger direct_llama recovery (and its llama restart) when the
+            # failing service is the broker route — e.g. a broker-adapter bug
+            # outside its sanitized raises. Direct/legacy keeps the old default.
+            default_target = (
+                "none"
+                if summarization_route_name(self.summarization_service) == "broker"
+                else "direct_llama"
+            )
+            recovery_target = getattr(exc, "recovery_target", default_target)
             if recovery_target not in {"direct_llama", "none"}:
                 recovery_target = "direct_llama"
             self.summary_paused = True

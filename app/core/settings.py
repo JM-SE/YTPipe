@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     broker_bearer_token: str = Field(default="", alias="BROKER_BEARER_TOKEN")
     broker_timeout_seconds: float | None = Field(default=None, alias="BROKER_TIMEOUT_SECONDS")
     broker_probe_max_transcript_characters: int = Field(default=30_000, alias="BROKER_PROBE_MAX_TRANSCRIPT_CHARACTERS")
+    # Route selector for Y02b. Inert by default: absent/unrecognized resolves
+    # to direct inference; only the route resolver reads it, never runtime
+    # validation and never the manual probe CLI.
+    summary_route: str = Field(default="", alias="SUMMARY_ROUTE")
 
     @property
     def normalized_telegram_bot_username(self) -> str:

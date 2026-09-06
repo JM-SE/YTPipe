@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from collections.abc import Generator
 from urllib.parse import urlparse
@@ -22,11 +23,13 @@ from app.services.llama_recovery import LlamaRecoveryService
 from app.services.mobile_push import MobilePushService
 from app.services.pipeline import PipelineService
 from app.services.polling import POLLING_PROCESS, YouTubePollingService
-from app.services.direct_summarization import build_summarization_gateway
+from app.services.summary_route import build_routed_summarization_gateway, close_routed_summarization_gateway
 from app.services.telegram import TelegramDeliveryService
 from app.services.transcript import TranscriptService
 
 router = APIRouter(prefix="/internal", tags=["polling"])
+
+logger = logging.getLogger(__name__)
 
 GOOGLE_REAUTH_REQUIRED_DETAILS = {
     "Stored Google credentials can no longer be refreshed. Manual re-auth is required.",
@@ -145,6 +148,12 @@ def run_poll(
         if settings.app_env == "local":
             detail = f"Polling run failed: {exc}"
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
+    finally:
+        if "polling_service" in locals():
+            _close_gateway_quietly(polling_service.summarization_service, root="polling")
+            _close_gateway_quietly(
+                polling_service.pipeline_service.summarization_service, root="polling-pipeline"
+            )
 
     return PollRunResponse(
         run_outcome=summary.run_outcome,
@@ -208,6 +217,12 @@ def reconcile_missing_uploads(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Reconciliation failed. Inspect service logs or reconciliation state for details.",
         ) from exc
+    finally:
+        if "polling_service" in locals():
+            _close_gateway_quietly(polling_service.summarization_service, root="polling")
+            _close_gateway_quietly(
+                polling_service.pipeline_service.summarization_service, root="polling-pipeline"
+            )
 
     return ReconciliationResponse(
         channels_processed=summary.channels_processed,
@@ -218,7 +233,29 @@ def reconcile_missing_uploads(
     )
 
 
+def _close_gateway_quietly(service: object, *, root: str) -> None:
+    """Close one routed gateway without letting a close failure mask the caller.
+
+    Used by the polling handlers so a failing ``close()`` on one gateway
+    cannot skip closing the other. Close errors are logged, never raised.
+    """
+
+    try:
+        close_routed_summarization_gateway(service)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("polling gateway close failed", extra={"root": root, "error": str(exc)})
+
+
 def _build_polling_service(settings: Settings) -> YouTubePollingService:
+    polling_gateway = build_routed_summarization_gateway(settings, root="polling")
+    try:
+        pipeline_gateway = build_routed_summarization_gateway(settings, root="polling-pipeline")
+    except Exception:
+        # The second build failed after the first one already constructed its
+        # broker client: release it here because the caller's
+        # ``if "polling_service" in locals()`` guard would otherwise be false.
+        close_routed_summarization_gateway(polling_gateway)
+        raise
     return YouTubePollingService(
         auth_service=GoogleOAuthService(settings),
         email_service=EmailDeliveryService(settings),
@@ -228,10 +265,10 @@ def _build_polling_service(settings: Settings) -> YouTubePollingService:
         mobile_push_service=MobilePushService(settings),
         telegram_service=TelegramDeliveryService(settings),
         transcript_service=TranscriptService(settings),
-        summarization_service=build_summarization_gateway(settings),
+        summarization_service=polling_gateway,
         pipeline_service=PipelineService(
             transcript_service=TranscriptService(settings),
-            summarization_service=build_summarization_gateway(settings),
+            summarization_service=pipeline_gateway,
             telegram_service=TelegramDeliveryService(settings),
             startup_batch_size=settings.pipeline_startup_batch_size,
             startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
