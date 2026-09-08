@@ -24,6 +24,7 @@ from app.models.user import User
 from app.models.user_channel import UserChannel
 from app.models.video import Video
 from app.services.email import EmailDeliveryAttemptError
+from app.services.pipeline import PipelineService
 from app.services.polling import POLLING_PROCESS, QUOTA_PROCESS, SUMMARIZATION_PROCESS, YouTubePollingService
 from app.services.telegram import TelegramDeliveryService
 
@@ -1944,10 +1945,18 @@ def test_summary_circuit_alert_persists_and_restarts_once(db_session, monkeypatc
     db_session.add(video)
     db_session.commit()
 
+    stage = PipelineStage(
+        video_id=video.id,
+        user_id=user.id,
+        stage="summary",
+        status="pending_retry",
+        failure_class="transient",
+        failure_code="direct_transport_error",
+        last_error="El servicio directo no está disponible temporalmente.",
+    )
+    db_session.add(stage)
+    db_session.flush()
     pipeline_service = polling_module.PipelineService()
-    pipeline_service.summary_paused = True
-    pipeline_service.summary_pause_reason = "Summarization server returned HTTP 500: Vulkan device lost."
-    pipeline_service.summary_pause_video_id = video.id
     telegram_service = TelegramDeliveryService(settings)
     sent_messages: list[str] = []
     monkeypatch.setattr(telegram_service, "send_message", lambda text: sent_messages.append(text))
@@ -1980,9 +1989,9 @@ def test_summary_circuit_alert_persists_and_restarts_once(db_session, monkeypatc
         datetime.now(UTC),
     )
     assert len(sent_messages) == 1
-    assert "Vulkan device lost" in sent_messages[0]
-    assert summarization_state.state_metadata["paused"] is True
-    assert summarization_state.state_metadata["restart_succeeded"] is True
+    assert "servicio directo" in sent_messages[0]
+    assert summarization_state.state_metadata["paused"] is False
+    assert summarization_state.state_metadata["direct_incident"]["restart_succeeded"] is True
 
     polling_service._finalize_summary_circuit(
         db_session,
@@ -1991,3 +2000,223 @@ def test_summary_circuit_alert_persists_and_restarts_once(db_session, monkeypatc
         datetime.now(UTC),
     )
     assert len(sent_messages) == 1
+
+
+def _reconcile_client(
+    app,
+    db_session,
+    *,
+    settings: Settings,
+    monkeypatch,
+    service: object,
+) -> TestClient:
+    """Wire the app with a stubbed polling service for the quarantine endpoint."""
+    monkeypatch.setattr(polling_route_module, "_build_polling_service", lambda _settings: service)  # type: ignore[arg-type]
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_db_session] = lambda: db_session
+    return TestClient(app)
+
+
+class _StubPollingService:
+    """Thin wrapper delegating to the real audited reconciliation service."""
+
+    def __init__(self, pipeline_service):
+        self.pipeline_service = pipeline_service
+        self.summarization_service = type("Svc", (), {"close": lambda self: None})()
+        self._service = YouTubePollingService(
+            auth_service=object(),
+            email_service=object(),
+            daily_quota_budget=100,
+            safety_stop_enabled=True,
+            pipeline_service=pipeline_service,
+        )
+        self.reference: str | None = None
+
+    def request_quarantine_reconciliation(
+        self, session, user, stage_id, *, resolution_reference, actor_source="admin_bearer"
+    ):
+        self.reference = resolution_reference
+        return self._service.request_quarantine_reconciliation(
+            session,
+            user,
+            stage_id,
+            resolution_reference=resolution_reference,
+            actor_source=actor_source,
+        )
+
+
+def test_reconcile_quarantined_summary_requires_auth_and_validates(db_session, monkeypatch) -> None:
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        DATABASE_URL="sqlite://",
+    )
+    db_session.add(User(email="owner@example.com"))
+    db_session.commit()
+    pipeline = PipelineService()
+    stub = _StubPollingService(pipeline)
+    client = _reconcile_client(app, db_session, settings=settings, monkeypatch=monkeypatch, service=stub)
+    try:
+        no_auth = client.post(
+            "/internal/reconcile-quarantined-summary",
+            json={"stage_id": 1, "resolution_reference": "op-1"},
+        )
+        assert no_auth.status_code == 401
+
+        blank_ref = client.post(
+            "/internal/reconcile-quarantined-summary",
+            headers={"Authorization": "Bearer internal-secret"},
+            json={"stage_id": 1, "resolution_reference": "   "},
+        )
+        assert blank_ref.status_code == 422
+
+        missing_stage = client.post(
+            "/internal/reconcile-quarantined-summary",
+            headers={"Authorization": "Bearer internal-secret"},
+            json={"stage_id": 9999, "resolution_reference": "op-1"},
+        )
+        assert missing_stage.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_reconcile_quarantined_summary_rejects_non_eligible_stages(db_session, monkeypatch) -> None:
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        DATABASE_URL="sqlite://",
+    )
+    user = User(email="owner@example.com")
+    db_session.add(user)
+    db_session.commit()
+    pipeline = PipelineService()
+    stub = _StubPollingService(pipeline)
+    client = _reconcile_client(app, db_session, settings=settings, monkeypatch=monkeypatch, service=stub)
+    try:
+        def _make_video(suffix: str) -> Video:
+            channel = Channel(youtube_channel_id=f"UC-REC-{suffix}", title=f"Rec {suffix}")
+            video = Video(
+                youtube_video_id=f"rec-video-{suffix}",
+                channel=channel,
+                title=f"Rec Video {suffix}",
+                published_at=datetime.now(UTC),
+            )
+            db_session.add_all([channel, video])
+            db_session.flush()
+            return video
+
+        def _make_stage(video: Video, **overrides) -> PipelineStage:
+            stage = PipelineStage(
+                video_id=video.id,
+                user_id=user.id,
+                stage="summary",
+                **overrides,
+            )
+            db_session.add(stage)
+            db_session.commit()
+            return stage
+
+        # Known-ID quarantine in the correct state is eligible.
+        eligible_video = _make_video("eligible")
+        eligible = _make_stage(
+            eligible_video,
+            status="pending_retry",
+            quarantined_at=datetime.now(UTC),
+            reconciliation_status="awaiting_operator_resolution",
+            broker_task_id="t-1",
+        )
+        ok = client.post(
+            "/internal/reconcile-quarantined-summary",
+            headers={"Authorization": "Bearer internal-secret"},
+            json={"stage_id": eligible.id, "resolution_reference": "op-1"},
+        )
+        assert ok.status_code == 200
+        assert ok.json() == {"stage_id": eligible.id, "get_eligible": True}
+        assert stub.reference == "op-1"
+        db_session.refresh(eligible)
+        assert eligible.reconciliation_status == "get_eligible"
+
+        # No-ID quarantine is rejected with 409.
+        no_id_video = _make_video("no-id")
+        no_id = _make_stage(
+            no_id_video,
+            status="pending_retry",
+            quarantined_at=datetime.now(UTC),
+            reconciliation_status="awaiting_operator_resolution",
+        )
+        rejected = client.post(
+            "/internal/reconcile-quarantined-summary",
+            headers={"Authorization": "Bearer internal-secret"},
+            json={"stage_id": no_id.id, "resolution_reference": "op-1"},
+        )
+        assert rejected.status_code == 409
+
+        # Non-quarantined known-ID stage is rejected with 409.
+        plain_video = _make_video("plain")
+        plain = _make_stage(
+            plain_video,
+            status="pending",
+            broker_task_id="t-2",
+        )
+        wrong_state = client.post(
+            "/internal/reconcile-quarantined-summary",
+            headers={"Authorization": "Bearer internal-secret"},
+            json={"stage_id": plain.id, "resolution_reference": "op-1"},
+        )
+        assert wrong_state.status_code == 409
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_reconcile_quarantined_summary_records_audited_operator_resolution(db_session, monkeypatch) -> None:
+    settings = Settings(
+        APP_SECRET_KEY="super-secret",
+        INTERNAL_API_BEARER_TOKEN="internal-secret",
+        DATABASE_URL="sqlite://",
+    )
+    user = User(email="owner@example.com")
+    db_session.add(user)
+    db_session.commit()
+    pipeline = PipelineService()
+    stub = _StubPollingService(pipeline)
+    client = _reconcile_client(app, db_session, settings=settings, monkeypatch=monkeypatch, service=stub)
+    try:
+        channel = Channel(youtube_channel_id="UC-AUD", title="Audit")
+        video = Video(
+            youtube_video_id="audit-video",
+            channel=channel,
+            title="Audit Video",
+            published_at=datetime.now(UTC),
+        )
+        db_session.add_all([channel, video])
+        db_session.flush()
+        stage = PipelineStage(
+            video_id=video.id,
+            user_id=user.id,
+            stage="summary",
+            status="pending_retry",
+            quarantined_at=datetime.now(UTC),
+            reconciliation_status="awaiting_operator_resolution",
+            broker_task_id="t-1",
+        )
+        db_session.add(stage)
+        db_session.commit()
+
+        ok = client.post(
+            "/internal/reconcile-quarantined-summary",
+            headers={"Authorization": "Bearer internal-secret"},
+            json={"stage_id": stage.id, "resolution_reference": "  op-42  "},
+        )
+        assert ok.status_code == 200
+        db_session.refresh(stage)
+        import json as _json
+
+        audit = _json.loads(stage.reconciliation_reason or "{}")
+        assert audit["actor_source"] == "admin_bearer"
+        assert audit["reference"] == "op-42"
+        assert audit["stage_id"] == stage.id
+        assert audit["outcome"] == "get_eligible"
+        assert "resolved_at" in audit
+        assert stage.reconciliation_status == "get_eligible"
+    finally:
+        app.dependency_overrides.clear()

@@ -4,10 +4,10 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Callable
 
-from sqlalchemy import exists, or_, select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.orm import Session, aliased
 
 from app.models.channel import Channel
@@ -17,8 +17,11 @@ from app.models.user import User
 from app.models.video import Video
 from app.services.telegram import TelegramDeliveryAttemptError, TelegramDeliveryService, TelegramNotificationPayload
 from app.services.transcript import TranscriptService
+from app.services.broker_submission import BrokerSubmissionCoordinator
 from app.services.summarization_gateway import SummarizationGateway, SummaryGatewayContext
 from app.services.summary_route import summarization_route_name
+from app.services.summary_failure_policy import SummaryFailureOutcome, classify_summary_failure
+from app.services.telegram_failure_notice import format_summary_failure_code, format_summary_failure_notice
 
 logger = logging.getLogger(__name__)
 _SUMMARY_INFERENCE_LOCK = threading.Lock()
@@ -194,6 +197,14 @@ class PipelineService:
                 "Shared content processing was previously skipped and cannot be reopened.",
             )
 
+        if summary_stage is not None and summary_stage.quarantined_at is not None:
+            return ContentProcessingResult(
+                "failed",
+                "Resumen no disponible. Motivo: "
+                f"{format_summary_failure_code(summary_stage.failure_code)} "
+                "Estado: requiere resolución operativa antes de continuar.",
+            )
+
         self._attempt_transcript_stage(session, transcript_stage, video)
         if transcript_stage is not None and transcript_stage.status == STATUS_FAILED:
             self._skip_stage(session, summary_stage)
@@ -300,6 +311,71 @@ class PipelineService:
         """Terminally skip queued Short stages before any recovery or drain work."""
         self._skip_disabled_short_stages_for_user(session, user.id)
 
+    def reconcile_quarantined_summaries(self, session: Session, user: User) -> int:
+        """Reconcile persisted broker tasks; adapters perform GET only."""
+        gateway = self.summarization_service
+        reconcile = getattr(gateway, "reconcile", None)
+        if not callable(reconcile):
+            return 0
+        rows = session.execute(
+            select(PipelineStage, Video).join(Video, PipelineStage.video_id == Video.id).where(
+                PipelineStage.user_id == user.id,
+                PipelineStage.stage == STAGE_SUMMARY,
+                PipelineStage.quarantined_at.is_not(None),
+                PipelineStage.broker_task_id.is_not(None),
+                PipelineStage.reconciliation_status == "get_eligible",
+                or_(PipelineStage.next_reconcile_at.is_(None), PipelineStage.next_reconcile_at <= datetime.now(UTC)),
+            )
+        ).all()
+        completed = 0
+        for stage, video in rows:
+            try:
+                summary = reconcile(
+                    stage.broker_task_id,
+                    idempotency_key=stage.broker_idempotency_key,
+                )
+            except Exception as exc:
+                stage.last_error = format_summary_failure_code(getattr(exc, "broker_code", None) or getattr(exc, "code", None))
+                stage.failure_code = getattr(exc, "broker_code", None) or getattr(exc, "code", None) or "broker_task_failed"
+                stage.failure_class = getattr(exc, "failure_class", None) or "indeterminate"
+                if stage.failure_class == "indeterminate":
+                    stage.reconciliation_status = "get_eligible"
+                    stage.next_reconcile_at = datetime.now(UTC) + timedelta(seconds=60)
+                else:
+                    stage.status = STATUS_FAILED
+                    stage.quarantined_at = None
+                    stage.reconciliation_status = None
+                continue
+            if summary is None:
+                stage.next_reconcile_at = datetime.now(UTC) + timedelta(seconds=60)
+                continue
+            video.summary = summary
+            stage.status = STATUS_COMPLETED
+            stage.last_error = None
+            stage.failure_class = None
+            stage.failure_code = None
+            stage.quarantined_at = None
+            stage.reconciliation_status = None
+            stage.next_reconcile_at = None
+            completed += 1
+        session.flush()
+        return completed
+
+    def make_quarantine_get_eligible(self, stage: PipelineStage) -> bool:
+        """Explicit operator-triggered transition; never submits work.
+
+        Only a known-ID stage currently quarantined as awaiting operator
+        resolution may become GET-eligible. No-ID quarantine stays blocked
+        (operator-controlled escalation) and never transitions itself.
+        """
+        if stage.quarantined_at is None or not stage.broker_task_id:
+            return False
+        if stage.reconciliation_status != "awaiting_operator_resolution":
+            return False
+        stage.reconciliation_status = "get_eligible"
+        stage.next_reconcile_at = datetime.now(UTC)
+        return True
+
     def process_pending_stages(
         self,
         session: Session,
@@ -324,6 +400,7 @@ class PipelineService:
                 PipelineStage.user_id == user.id,
                 PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
                 self._automatic_stage_intent_filter(user.id),
+                self._summary_due_filter(),
             )
             .order_by(PipelineStage.id.asc())
         )
@@ -457,6 +534,7 @@ class PipelineService:
                 PipelineStage.user_id == user.id,
                 PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
                 self._automatic_stage_intent_filter(user.id),
+                self._summary_due_filter(),
             )
             .order_by(Video.published_at.asc().nullsfirst(), Video.id.asc())
             .limit(1)
@@ -488,6 +566,7 @@ class PipelineService:
                 PipelineStage.user_id == user.id,
                 PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
                 self._automatic_stage_intent_filter(user.id),
+                self._summary_due_filter(),
             )
             .group_by(Video.id, Video.published_at)
             .order_by(Video.published_at.asc().nullsfirst(), Video.id.asc())
@@ -546,8 +625,9 @@ class PipelineService:
             select(PipelineStage)
             .where(
                 PipelineStage.user_id == user.id,
-                PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
-                self._automatic_stage_intent_filter(user.id),
+                    PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
+                    self._automatic_stage_intent_filter(user.id),
+                    self._summary_due_filter(),
             )
             .order_by(PipelineStage.id.asc())
             .limit(self.startup_batch_size)
@@ -585,6 +665,7 @@ class PipelineService:
                 PipelineStage.user_id == user.id,
                 PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
                 self._automatic_stage_intent_filter(user.id),
+                self._summary_due_filter(),
             )
             .order_by(PipelineStage.id.asc())
         ).scalars().all()
@@ -604,6 +685,7 @@ class PipelineService:
                         PipelineStage.user_id == user.id,
                         PipelineStage.status.in_([STATUS_PENDING, STATUS_PENDING_RETRY]),
                         self._automatic_stage_intent_filter(user.id),
+                        self._summary_due_filter(),
                     )
                     .order_by(PipelineStage.id.asc())
                     .limit(self.startup_batch_size)
@@ -658,10 +740,10 @@ class PipelineService:
                 transcript = result.text
                 if result.permanent:
                     stage.status = STATUS_FAILED
-                    stage.last_error = result.error or "Transcript not available for this video."
+                    stage.last_error = "No se encontró una transcripción utilizable."
                     return
                 if result.outcome == "retryable":
-                    stage.last_error = result.error or "Transcript provider failed temporarily."
+                    stage.last_error = "El proveedor de transcripción no está disponible temporalmente."
                     stage.status = (
                         STATUS_FAILED
                         if stage.attempt_count >= stage.max_attempts
@@ -672,7 +754,7 @@ class PipelineService:
                 transcript = self.transcript_service.fetch_transcript(video.youtube_video_id)
         except Exception as exc:
             transcript = None
-            stage.last_error = str(exc)
+            stage.last_error = "El proveedor de transcripción no está disponible temporalmente."
 
         if transcript:
             video.transcript = transcript
@@ -681,7 +763,7 @@ class PipelineService:
             return
 
         if stage.last_error is None:
-            stage.last_error = "Transcript not available for this video."
+            stage.last_error = "No se encontró una transcripción utilizable."
 
         if stage.attempt_count >= stage.max_attempts:
             stage.status = STATUS_FAILED
@@ -698,7 +780,10 @@ class PipelineService:
             return False
         if stage.status not in (STATUS_PENDING, STATUS_PENDING_RETRY):
             return False
-        if self.summary_paused:
+        if getattr(stage, "quarantined_at", None) is not None:
+            return False
+        next_attempt_at = getattr(stage, "next_attempt_at", None)
+        if next_attempt_at is not None and next_attempt_at > datetime.now(UTC):
             return False
         if video.summary is not None:
             stage.status = STATUS_COMPLETED
@@ -706,10 +791,14 @@ class PipelineService:
         if self.summarization_service is None:
             stage.status = STATUS_FAILED
             stage.last_error = "Summarization service not available."
+            stage.failure_class = "internal"
+            stage.failure_code = "summary_service_unavailable"
             return True
         if video.transcript is None:
             stage.status = STATUS_FAILED
             stage.last_error = "No transcript available to summarize."
+            stage.failure_class = "permanent"
+            stage.failure_code = "no_transcript"
             return True
 
         attempted_at = datetime.now(UTC)
@@ -717,6 +806,11 @@ class PipelineService:
         stage.last_attempt_at = attempted_at
 
         route = summarization_route_name(self.summarization_service)
+        if route == "broker":
+            return self._attempt_broker_summary_stage(
+                session, stage, video, attempted_at
+            )
+
         try:
             # Per-summarization route attribution for Y02 one-to-one
             # reconciliation: route plus stage/video identifiers only, logged
@@ -730,12 +824,22 @@ class PipelineService:
             )
             # llama.cpp runs on the local homelab GPU. Keep every entrypoint to
             # the model serialized, including retries and incident recovery.
+            context = SummaryGatewayContext(stage_id=stage.id)
             with _SUMMARY_INFERENCE_LOCK:
                 summary = self.summarization_service.summarize(
-                    video.transcript, context=SummaryGatewayContext(stage_id=stage.id)
+                    video.transcript, context=context
                 )
         except Exception as exc:
             summary = None
+            code = getattr(exc, "code", None)
+            broker_failure_class = getattr(exc, "failure_class", None)
+            if route == "broker" and getattr(exc, "broker_code", None):
+                code = exc.broker_code
+            if not isinstance(code, str) or not code:
+                if route == "broker":
+                    code = "broker_protocol_error"
+                else:
+                    code = "direct_transport_error"
             stage.last_error = _compact_error(str(exc))
             # Route-aware default: an exception without an explicit target must
             # not trigger direct_llama recovery (and its llama restart) when the
@@ -748,25 +852,49 @@ class PipelineService:
             )
             recovery_target = getattr(exc, "recovery_target", default_target)
             if recovery_target not in {"direct_llama", "none"}:
-                recovery_target = "direct_llama"
+                recovery_target = "none"
             # Sanitized failure code for canary observability: stable
             # machine-safe category only (never content/credentials). Count
             # these records against summary_route_attributed to measure the
             # frozen abort thresholds (e.g. >20% broker_output_incomplete).
-            failure_code = getattr(exc, "code", None)
-            if failure_code is None:
-                failure_code = "broker_unknown" if route == "broker" else "direct_error"
             logger.info(
                 "summary_failed code=%s route=%s stage_id=%s video_id=%s",
-                failure_code,
+                code,
                 route,
                 stage.id,
                 video.id,
             )
-            self.summary_paused = True
-            self.summary_pause_reason = stage.last_error
-            self.summary_pause_video_id = video.id
-            stage.status = STATUS_PENDING_RETRY
+            outcome = classify_summary_failure(
+                route=route,
+                code=code,
+                attempt_count=stage.attempt_count,
+                max_attempts=stage.max_attempts,
+                now=attempted_at,
+                broker_failure_class=broker_failure_class,
+            )
+            stage.failure_class = outcome.failure_class
+            stage.failure_code = outcome.failure_code
+            stage.last_error = outcome.display_reason
+            stage.next_attempt_at = outcome.retry_at
+            broker_task_id = getattr(exc, "task_id", None)
+            broker_key = getattr(exc, "idempotency_key", None)
+            if route == "broker":
+                if isinstance(broker_task_id, str) and broker_task_id:
+                    stage.broker_task_id = broker_task_id[:128]
+                if isinstance(broker_key, str) and broker_key:
+                    stage.broker_idempotency_key = broker_key[:128]
+            if outcome.disposition == "quarantine":
+                stage.quarantined_at = attempted_at
+                stage.reconciliation_status = "awaiting_operator_resolution"
+                stage.next_reconcile_at = None
+                stage.reconciliation_reason = outcome.display_reason
+                if stage.broker_task_id is None:
+                    stage.reconciliation_alerted_at = None
+                stage.status = STATUS_PENDING_RETRY
+            elif outcome.disposition == "terminal":
+                stage.status = STATUS_FAILED
+            else:
+                stage.status = STATUS_PENDING_RETRY
             self._summary_recovery_target = recovery_target
             return True
 
@@ -774,6 +902,10 @@ class PipelineService:
             video.summary = summary
             stage.status = STATUS_COMPLETED
             stage.last_error = None
+            stage.failure_class = None
+            stage.failure_code = None
+            stage.next_attempt_at = None
+            stage.quarantined_at = None
             self._summary_recovery_target = None
             self._clear_summary_failure_state(session, user_id=stage.user_id)
             return True
@@ -785,6 +917,52 @@ class PipelineService:
             stage.status = STATUS_FAILED
         else:
             stage.status = STATUS_PENDING_RETRY
+        return True
+
+    def _attempt_broker_summary_stage(
+        self,
+        session: Session,
+        stage: PipelineStage,
+        video: Video,
+        attempted_at: datetime,
+    ) -> bool:
+        """Crash-safe broker submission owned by ``BrokerSubmissionCoordinator``.
+
+        The coordinator persists the deterministic key and a conservative
+        pre-submit marker before the POST, then the task ID and the same key
+        before the first result GET. A stage already marked ``prepared`` or
+        ``accepted`` is a crash residue and is converted to a durable
+        quarantine (never re-submitted, never re-polled) awaiting explicit
+        operator resolution.
+        """
+        logger.info(
+            "summary_route_attributed route=broker stage_id=%s video_id=%s",
+            stage.id,
+            video.id,
+        )
+        context = SummaryGatewayContext(stage_id=stage.id)
+        coordinator = BrokerSubmissionCoordinator(
+            self.summarization_service,
+            timeout_seconds=getattr(self.summarization_service, "timeout_seconds", None),
+        )
+        with _SUMMARY_INFERENCE_LOCK:
+            outcome = coordinator.attempt(
+                session,
+                stage,
+                video,
+                context=context,
+                attempted_at=attempted_at,
+            )
+        self._summary_recovery_target = "none"
+        if outcome.disposition == "completed":
+            self._clear_summary_failure_state(session, user_id=stage.user_id)
+            return True
+        logger.info(
+            "summary_failed code=%s route=broker stage_id=%s video_id=%s",
+            outcome.failure_code,
+            stage.id,
+            video.id,
+        )
         return True
 
     def attempt_summary_recovery(self, session: Session, user: User) -> bool | None:
@@ -852,8 +1030,8 @@ class PipelineService:
         metadata["recovery_pending_alert"] = False
         metadata["last_error"] = self.summary_pause_reason or "Unknown summarization failure."
         failure = dict(metadata.get("summary_failure") or {})
-        target = getattr(self, "_summary_recovery_target", None) or failure.get("recovery_target") or "direct_llama"
-        failure["recovery_target"] = target if target in {"direct_llama", "none"} else "direct_llama"
+        target = getattr(self, "_summary_recovery_target", None) or failure.get("recovery_target") or "none"
+        failure["recovery_target"] = target if target in {"direct_llama", "none"} else "none"
         metadata["summary_failure"] = failure
         if self.summary_pause_video_id is not None:
             metadata["failed_video_id"] = self.summary_pause_video_id
@@ -1022,12 +1200,38 @@ class PipelineService:
         title = video.title or video.youtube_video_id
         channel_title = channel.title or "Canal desconocido"
         video_url = f"https://www.youtube.com/watch?v={video.youtube_video_id}"
-        message = FALLBACK_MESSAGE_TEMPLATE.format(
-            title=title,
-            channel=channel_title,
-            url=video_url,
-            reason=reason,
-        )
+        summary_stage = stage_map.get(STAGE_SUMMARY)
+        if summary_stage is not None and (
+            summary_stage.status == STATUS_FAILED or summary_stage.quarantined_at is not None
+        ):
+            disposition = "quarantine" if summary_stage.quarantined_at is not None else "terminal"
+            outcome = SummaryFailureOutcome(
+                route="broker" if summary_stage.failure_class in {
+                    "client_invalid", "policy_rejected", "backend_rejected", "output_invalid", "indeterminate"
+                } else "direct",
+                failure_class=summary_stage.failure_class or "permanent",
+                failure_code=summary_stage.failure_code or "summary_failure",
+                disposition=disposition,
+                retry_at=None,
+                recovery_owner="operator",
+                recovery_action="broker_resolve" if disposition == "quarantine" else "none",
+                # Reconciliation metadata may contain an operator reference;
+                # never use it as user-facing text.
+                display_reason=format_summary_failure_code(summary_stage.failure_code),
+            )
+            message = (
+                f"{format_summary_failure_notice(outcome, title)}\n"
+                f"Canal: {channel_title}\nURL: {video_url}\n"
+                f"{FALLBACK_REASON_SUMMARY.format(max_attempts=summary_stage.max_attempts)} "
+                f"Causa: {_compact_error(summary_stage.last_error or reason)}"
+            )
+        else:
+            message = FALLBACK_MESSAGE_TEMPLATE.format(
+                title=title,
+                channel=channel_title,
+                url=video_url,
+                reason=reason,
+            )
 
         attempted_at = datetime.now(UTC)
         fallback_stage.attempt_count += 1
@@ -1049,6 +1253,9 @@ class PipelineService:
 
         fallback_stage.status = STATUS_COMPLETED
         fallback_stage.last_error = None
+        summary_stage = stage_map.get(STAGE_SUMMARY)
+        if summary_stage is not None and summary_stage.quarantined_at is not None:
+            summary_stage.reconciliation_alerted_at = attempted_at
         return True
 
     def _get_or_create_fallback_stage(
@@ -1122,6 +1329,20 @@ class PipelineService:
             ),
         )
 
+    @staticmethod
+    def _summary_due_filter():
+        """Exclude delayed and quarantined summary stages from auto-drain."""
+        return or_(
+            PipelineStage.stage != STAGE_SUMMARY,
+            and_(
+                PipelineStage.quarantined_at.is_(None),
+                or_(
+                    PipelineStage.next_attempt_at.is_(None),
+                    PipelineStage.next_attempt_at <= datetime.now(UTC),
+                ),
+            ),
+        )
+
     def _skip_disabled_short_stages_for_user(self, session: Session, user_id: int) -> None:
         if self.shorts_processing_enabled:
             return
@@ -1167,7 +1388,9 @@ class PipelineService:
             stage = stage_map.get(stage_name)
             if stage is None:
                 continue
-            if stage.status == STATUS_FAILED:
+            if stage.status == STATUS_FAILED or (
+                stage_name == STAGE_SUMMARY and stage.quarantined_at is not None
+            ):
                 return True
         return False
 
@@ -1179,15 +1402,42 @@ class PipelineService:
             stage = stage_map.get(stage_name)
             if stage is None:
                 continue
-            if stage.status != STATUS_FAILED:
+            if stage.status != STATUS_FAILED and stage.quarantined_at is None:
                 continue
 
             if stage_name == STAGE_TRANSCRIPT:
                 reason = FALLBACK_REASON_TRANSCRIPT.format(max_attempts=stage.max_attempts)
                 return f"{reason} Causa: {_compact_error(stage.last_error or reason)}"
             if stage_name == STAGE_SUMMARY:
+                if stage.quarantined_at is not None:
+                    outcome = SummaryFailureOutcome(
+                        route="broker",
+                        failure_class=stage.failure_class or "indeterminate",
+                        failure_code=stage.failure_code or "broker_task_indeterminate",
+                        disposition="quarantine",
+                        retry_at=None,
+                        recovery_owner="operator",
+                        recovery_action="broker_resolve",
+                        # Reconciliation metadata may contain an operator
+                        # reference; only the code-derived reason is safe for
+                        # Telegram/user-facing output.
+                        display_reason=format_summary_failure_code(stage.failure_code),
+                    )
+                    return format_summary_failure_notice(outcome)
                 reason = FALLBACK_REASON_SUMMARY.format(max_attempts=stage.max_attempts)
-                return f"{reason} Causa: {_compact_error(stage.last_error or reason)}"
+                specific = format_summary_failure_code(stage.failure_code) if stage.failure_code else stage.last_error
+                outcome = SummaryFailureOutcome(
+                    route="broker" if stage.failure_class in {"client_invalid", "policy_rejected", "backend_rejected", "output_invalid", "indeterminate"} else "direct",
+                    failure_class=stage.failure_class or "permanent",
+                    failure_code=stage.failure_code or "summary_failure",
+                    disposition="terminal",
+                    retry_at=None,
+                    recovery_owner="operator",
+                    recovery_action="none",
+                    display_reason=specific or reason,
+                )
+                notice = format_summary_failure_notice(outcome)
+                return notice
             if stage_name == STAGE_TELEGRAM:
                 reason = FALLBACK_REASON_TELEGRAM.format(max_attempts=stage.max_attempts)
                 return f"{reason} Causa: {_compact_error(stage.last_error or reason)}"

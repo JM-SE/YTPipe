@@ -43,6 +43,7 @@ include = ["app*"]
     "alembic/versions/20260713_0008_add_is_short_to_videos.py",
     "alembic/versions/20260728_0009_add_telegram_command_requests.py",
     "alembic/versions/20260728_0010_expand_telegram_command_url.py",
+    "alembic/versions/20260907_0011_add_pipeline_stage_recovery_state.py",
 ]
 
 [tool.pytest.ini_options]

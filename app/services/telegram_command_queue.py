@@ -185,7 +185,9 @@ class TelegramCommandQueueService:
             request.reply_started_at = None
             request.lease_expires_at = None
             request.lease_token = None
-            request.last_error = "Previous Telegram reply lease expired."
+            # Do not overwrite `last_error`: for a failed content stage it holds
+            # the canonical sanitized quarantine/terminal reason that
+            # `_reply_message` must keep delivering after a stale reply lease.
         self.session.flush()
 
     def _terminalize_exhausted_requests(self) -> None:
@@ -324,14 +326,12 @@ class TelegramCommandQueueService:
             elif content_result.outcome == "failed":
                 self._finish_processing(request, token, "failed", content_result.error)
             else:
-                if pipeline.summary_paused and getattr(pipeline, "_summary_recovery_target", "direct_llama") != "none":
-                    self._attempt_llama_recovery(user.id)
                 self._finish_processing(
                     request,
                     token,
                     "pending_retry",
                     content_result.error or "Content processing is temporarily pending.",
-                    delay_seconds=300 if pipeline.summary_paused else 30,
+                    delay_seconds=30,
                 )
         finally:
             close_routed_summarization_gateway(pipeline.summarization_service)
@@ -359,7 +359,6 @@ class TelegramCommandQueueService:
             if not exc.retryable or request.reply_attempt_count >= request.reply_max_attempts:
                 values = {
                     "reply_status": "failed",
-                    "last_error": _sanitize_error(exc.message),
                     "reply_next_attempt_at": None,
                 }
             else:
@@ -368,8 +367,11 @@ class TelegramCommandQueueService:
                     "reply_next_attempt_at": datetime.now(UTC) + timedelta(
                         seconds=exc.retry_after_seconds or self._retry_delay(request.reply_attempt_count)
                     ),
-                    "last_error": _sanitize_error(exc.message),
                 }
+            # Do not overwrite `last_error`: for a failed content stage it holds
+            # the canonical sanitized quarantine/terminal reason that
+            # `_reply_message` must keep delivering on retries. The transport
+            # error is intentionally not persisted here.
             if not self._conditional_update(request.id, token, values):
                 return
             self.session.commit()
@@ -488,9 +490,9 @@ class TelegramCommandQueueService:
                 SyncState.process_type == SUMMARY_CIRCUIT_PROCESS,
             )
         )
-        summary_paused = bool(
-            summary_state and (summary_state.state_metadata or {}).get("paused", False)
-        )
+        # Legacy process-wide pause metadata is retained for audit only. It is
+        # not authoritative after Y02c and must not block a manual command.
+        summary_paused = False
         pipeline = PipelineService(
             transcript_service=TranscriptService(self.settings),
             summarization_service=build_routed_summarization_gateway(self.settings, root="telegram"),
@@ -499,8 +501,8 @@ class TelegramCommandQueueService:
             shorts_processing_enabled=self.settings.shorts_processing_enabled,
         )
         failure = (summary_state.state_metadata or {}).get("summary_failure") if summary_state else None
-        target = failure.get("recovery_target") if isinstance(failure, dict) else "direct_llama"
-        pipeline._summary_recovery_target = target if target in {"direct_llama", "none"} else "direct_llama"
+        target = failure.get("recovery_target") if isinstance(failure, dict) else "none"
+        pipeline._summary_recovery_target = target if target in {"direct_llama", "none"} else "none"
         return pipeline
 
     def _record_google_reauth_pause(self, user_id: int, error: str) -> None:
@@ -567,6 +569,8 @@ class TelegramCommandQueueService:
         if request.status == "rejected":
             return "No pude procesar esta solicitud. Revisa la URL o la configuración actual."
         if request.status == "failed":
+            if request.last_error and request.last_error.startswith("Resumen no disponible."):
+                return _truncate_telegram_text(request.last_error)
             return "No se pudo completar el resumen de este video."
         return "No se pudo completar la solicitud."
 

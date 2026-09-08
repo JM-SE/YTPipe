@@ -14,6 +14,7 @@ from app.api.dependencies import require_admin_bearer_token
 from app.core.settings import Settings, get_settings
 from app.db.session import get_db_session
 from app.models.oauth_account import OAuthAccount
+from app.models.pipeline_stage import PipelineStage
 from app.models.sync_state import SyncState
 from app.models.user import User
 from app.services.auth import GOOGLE_PROVIDER, GoogleOAuthService
@@ -61,6 +62,16 @@ class ReconciliationResponse(BaseModel):
 
 class ReconciliationRequest(BaseModel):
     process_recovered: bool = False
+
+
+class QuarantineReconciliationRequest(BaseModel):
+    stage_id: int
+    resolution_reference: str
+
+
+class QuarantineReconciliationResponse(BaseModel):
+    stage_id: int
+    get_eligible: bool
 
 
 def require_poll_execution_lock(
@@ -191,6 +202,8 @@ def reconcile_missing_uploads(
             OAuthAccount.provider == GOOGLE_PROVIDER,
         )
     )
+
+
     if oauth_account is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -231,6 +244,63 @@ def reconcile_missing_uploads(
         videos_processed=summary.videos_processed,
         channel_errors=summary.channel_errors,
     )
+
+
+@router.post(
+    "/reconcile-quarantined-summary",
+    dependencies=[Depends(require_admin_bearer_token), Depends(require_poll_execution_lock)],
+    response_model=QuarantineReconciliationResponse,
+    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+    summary="Authorize GET-only reconciliation of a quarantined summary",
+    description=(
+        "Records an operator resolution reference after the broker task was "
+        "resolved externally and enables GET-only reconciliation for a known "
+        "broker task. YTPipe never queries or executes llm-broker worker "
+        "resolve: the operator confirms resolution through the bounded "
+        "reference. Rejects blank references, unknown stages, non-quarantined "
+        "or wrong-state stages, and no-ID records."
+    ),
+)
+def reconcile_quarantined_summary(
+    request: QuarantineReconciliationRequest,
+    settings: Settings = Depends(get_settings),
+    session: Session = Depends(get_db_session),
+) -> QuarantineReconciliationResponse:
+    user = session.scalar(select(User))
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="No user is configured.")
+    if not request.resolution_reference.strip() or len(request.resolution_reference) > 256:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="A resolution reference is required.")
+    stage = session.scalar(
+        select(PipelineStage).where(
+            PipelineStage.id == request.stage_id,
+            PipelineStage.user_id == user.id,
+            PipelineStage.stage == "summary",
+        )
+    )
+    if stage is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Summary stage not found.")
+    polling_service = _build_polling_service(settings)
+    try:
+        eligible = polling_service.request_quarantine_reconciliation(
+            session,
+            user,
+            request.stage_id,
+            resolution_reference=request.resolution_reference,
+            actor_source="admin_bearer",
+        )
+        session.commit()
+    finally:
+        _close_gateway_quietly(polling_service.summarization_service, root="quarantine")
+        _close_gateway_quietly(
+            polling_service.pipeline_service.summarization_service, root="quarantine-pipeline"
+        )
+    if not eligible:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Stage is not an eligible known-task quarantine awaiting operator resolution.",
+        )
+    return QuarantineReconciliationResponse(stage_id=request.stage_id, get_eligible=True)
 
 
 def _close_gateway_quietly(service: object, *, root: str) -> None:

@@ -96,10 +96,14 @@ class SummarizationService:
             )
         except httpx.TimeoutException:
             logger.warning("Summarization timed out for prompt of length %d", len(prompt))
-            raise SummarizationRequestError("Summarization request timed out.") from None
-        except httpx.TransportError as exc:
-            logger.warning("Summarization network error: %s", exc)
-            raise SummarizationRequestError(f"Summarization network error: {exc}") from exc
+            raise SummarizationRequestError(
+                "Summarization request timed out.", code="direct_timeout", failure_class="transient"
+            ) from None
+        except httpx.TransportError:
+            logger.warning("Summarization network error")
+            raise SummarizationRequestError(
+                "Summarization network error.", code="direct_transport_error", failure_class="transient"
+            ) from None
 
         if response.status_code != 200:
             logger.warning("Summarization failed with status %d", response.status_code)
@@ -107,21 +111,64 @@ class SummarizationService:
             message = f"Summarization server returned HTTP {response.status_code}"
             if detail:
                 message = f"{message}: {detail}"
-            raise SummarizationRequestError(f"{message}.")
+            raise SummarizationRequestError(
+                f"{message}.",
+                code="direct_http_error",
+                failure_class="transient",
+            )
 
         try:
             data = response.json()
         except ValueError:
             logger.warning("Summarization returned invalid JSON")
-            raise SummarizationRequestError("Summarization server returned invalid JSON.") from None
+            raise SummarizationRequestError(
+                "Summarization server returned invalid JSON.",
+                code="direct_invalid_response",
+                failure_class="transient",
+            ) from None
+
+        if not isinstance(data, dict):
+            raise SummarizationRequestError(
+                "Summarization server returned an invalid response envelope.",
+                code="direct_invalid_response",
+                failure_class="transient",
+            )
 
         if "error" in data:
             logger.warning("Summarization server error: %s", data["error"])
-            raise SummarizationRequestError(f"Summarization server error: {data['error']}")
+            raise SummarizationRequestError(
+                "Summarization server returned an error.",
+                code="direct_provider_error",
+                failure_class="transient",
+            )
 
-        content: str = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        choices = data.get("choices")
+        if not isinstance(choices, list) or len(choices) == 0 or not isinstance(choices[0], dict):
+            raise SummarizationRequestError(
+                "Summarization server returned an invalid response envelope.",
+                code="direct_invalid_response",
+                failure_class="transient",
+            )
+        if "message" not in choices[0]:
+            raise SummarizationRequestError(
+                "Summarization server returned empty content.",
+                code="direct_empty_response",
+                failure_class="transient",
+            )
+        message = choices[0].get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            raise SummarizationRequestError(
+                "Summarization server returned an invalid response envelope.",
+                code="direct_invalid_response",
+                failure_class="transient",
+            )
+        content = message["content"]
         if not content.strip():
-            raise SummarizationRequestError("Summarization server returned empty content.")
+            raise SummarizationRequestError(
+                "Summarization server returned empty content.",
+                code="direct_empty_response",
+                failure_class="transient",
+            )
         return content.strip()
 
     @staticmethod
@@ -170,3 +217,14 @@ class SummarizationRequestError(Exception):
     """A failed local request whose reason belongs on its pipeline stage."""
 
     recovery_target = "direct_llama"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "direct_transport_error",
+        failure_class: str = "transient",
+    ):
+        super().__init__(message)
+        self.code = code
+        self.failure_class = failure_class

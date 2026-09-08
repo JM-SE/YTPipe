@@ -50,8 +50,9 @@ is `specs/telegram_summary_commands.spec.md`.
 2. `12B_telegram_command_processing.spec.md` - Add durable claiming/recovery, content-only pipeline reuse, cached-summary behavior, retries, and request-specific Telegram replies without the long-poll listener.
 3. `12C_telegram_long_polling_operations.spec.md` - Add the single-consumer long-poll listener, worker trigger loop, systemd operation, rollout, observability, and end-to-end verification.
 4. `Y00_broker_gateway_offline.spec.md` - Status: `accepted` at commit `ff05558`; no production deployment is claimed. It retains direct-only runtime composition, exact direct behavior, dormant/test-injected broker behavior, recovery target `none`, stable per-operation idempotency, broker-only validation, and fully offline tests.
-5. `Y01_broker_safe_connectivity_acceptance.spec.md` - Status: `implemented_offline_verified_acceptance_blocked_on_H03`. Implementation and offline review exist and manual synthetic connectivity succeeded. Final acceptance still requires broker H03 plus the controlled real-URL gate. Y01 is connectivity acceptance only, not product broker activation; direct normal composition remains unchanged. YTPipe baseline `8ae6aa5` is context, not Y01 acceptance.
-6. `Y02` - Status: `future` / `deferred` / `unapproved`. It may later own production routing selection/canary, durable terminal reconciliation/generation policy, cancellation, and load/distributed exclusivity, but none is currently authorized.
+5. `Y01_broker_safe_connectivity_acceptance.spec.md` - Status: `accepted` 2026-09-05. Implementation, offline review, compat desired/effective PASS (same digest), synthetic PASS, and exactly one consented URL probe PASS on a disposable H03 stack. Y01 is connectivity acceptance only, not product broker activation; direct normal composition remains unchanged.
+6. `Y02_broker_production_cutover.spec.md` - Status: `draft_pending_human_approval` for the amended closure/canary contract (original spec gate approved 2026-09-05; no new action authorized). Owns production routing cutover by a minimum-12h, representative-traffic canary with one-to-one broker/YTPipe/Telegram reconciliation. Closure may select broker as operational/default but must retain tested `SUMMARY_ROUTE=direct` as an independent, explicit rollback route; there is no automatic fallback or YTPipe-specific broker behavior. Every productive step needs separate operational approval. Route switch prerequisite: `Y02b_agnostic_route_resolver.spec.md` (single agnostic resolver, default direct, data-only canary/rollback).
+7. `Y02c_resilient_per_video_recovery.spec.md` - Status: `draft_pending_human_approval`. Current prerequisite before resuming or closing the Y02 canary: safe R3/R4 stabilization, direct-only cooldown-limited recovery, and durable broker indeterminate quarantine. It requires its own implementation acceptance and separate operational approval; any code/config change restarts the Y02 canary clock under Y02 abort rules.
 
 Phase 12C status: completed after automated and operator end-to-end
 verification. The listener unit remains available for explicit host rollout.
@@ -75,12 +76,18 @@ verification. The listener unit remains available for explicit host rollout.
   not access application persistence or content services directly.
 - Phases 12A, 12B, and 12C must be implemented and reviewed sequentially; human
   approval is required before advancing to the next phase.
-- Y01 depends on accepted Y00. Existing implementation/offline review and the
-  successful synthetic do not complete Y01 acceptance: accepted/implemented
+- Y01 depends on accepted Y00. Y01 acceptance is complete: accepted/implemented
   broker H03, compatibility desired/effective PASS, and the separately approved
-  one-URL acceptance gate are prerequisites.
-- Y01 does not activate normal broker routing. Y02 remains deferred and requires
-  a new approved specification after Y01 acceptance.
+  one-URL acceptance gate all passed on a disposable stack with no production
+  deployment.
+- Y01 does not activate normal broker routing. Y02 owns the production cutover
+  (minimum-12h representative-traffic canary and complete reconciliation), but
+  never disconnects the independent direct implementation. The amended
+  `Y02_broker_production_cutover.spec.md` is `draft_pending_human_approval`; no
+  new Y02 step is authorized before human spec approval plus separate per-step
+  operational approval.
+- Y02 canary resumption or closure depends on accepted Y02c safe stabilization;
+  it does not authorize a canary, deployment, restart, or route change.
 
 ## Risks
 - OAuth token handling can fail if refresh behavior is not treated as a strict persistence contract.

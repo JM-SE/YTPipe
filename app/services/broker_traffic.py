@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.services.broker_errors import BrokerSummarizationError, broker_error
-from app.services.broker_gateway import BrokerOperation, BrokerResult, BrokerTaskClient
+from app.services.broker_gateway import AcceptedTask, BrokerOperation, BrokerResult, BrokerTaskClient
 from app.services.broker_profile import BrokerRequestProfile, load_y01_profile
 from app.services.broker_summary import validate_broker_output
 from app.services.summarization import FINAL_SUMMARY_INSTRUCTIONS, SUMMARIZATION_SYSTEM_PROMPT
@@ -27,6 +27,12 @@ class BrokerTrafficSummarizationService:
     `stage_id`): the idempotency key re-derives identically for the same
     stage by design, so resubmitting the same stage is idempotent replay,
     never a new invocation.
+
+    Two-phase contract for the pipeline persistence owner:
+    ``submit_task`` performs the POST only and returns an accepted-task
+    handle (or a validated sync result); ``poll_task`` performs a single
+    GET. The adapter never polls on its own for the pipeline path, never
+    performs session I/O, and never owns durable transitions.
     """
 
     def __init__(self, task_client: BrokerTaskClient, *, profile: BrokerRequestProfile | None = None):
@@ -36,27 +42,79 @@ class BrokerTrafficSummarizationService:
     def close(self) -> None:
         self._client.close()
 
-    def summarize(self, transcript: str, *, context: SummaryGatewayContext | None = None) -> str:
+    @property
+    def timeout_seconds(self) -> float:
+        return self._client.timeout_seconds
+
+    def idempotency_key_for(self, transcript: str, context: SummaryGatewayContext) -> str:
+        operation = self._operation(transcript)
+        return idempotency_key(context, operation)
+
+    def submit_task(self, transcript: str, *, context: SummaryGatewayContext) -> AcceptedTask | str:
+        """POST only. Returns a validated summary for sync-200 or an accepted handle."""
         if context is None:
             raise broker_error("broker_context_missing")
-        operation = BrokerOperation(
+        operation = self._operation(transcript)
+        self._assert_request_size(operation)
+        try:
+            accepted = self._client.submit_task(operation, idempotency_key(context, operation))
+        except BrokerSummarizationError:
+            raise
+        except Exception:
+            raise broker_error("broker_error") from None
+        if isinstance(accepted, BrokerResult):
+            return self._validated_result(accepted)
+        return accepted
+
+    def poll_task(self, task_id: str, *, idempotency_key_value: str) -> str | None:
+        """Single GET result poll; None while the task is still pending."""
+        result = self._client.poll_result(task_id, idempotency_key_value)
+        if result is None:
+            return None
+        return self._validated_result(result)
+
+    def summarize(self, transcript: str, *, context: SummaryGatewayContext | None = None) -> str:
+        """Legacy blocking convenience (probes/tests only).
+
+        The pipeline persistence owner uses ``submit_task``/``poll_task`` so
+        the accepted task handle is durably stored before the first GET. This
+        fused method exists for non-pipeline callers and preserves the client's
+        injected clock/sleep semantics.
+        """
+        if context is None:
+            raise broker_error("broker_context_missing")
+        operation = self._operation(transcript)
+        self._assert_request_size(operation)
+        try:
+            result = self._client.submit_result(operation, idempotency_key(context, operation))
+        except BrokerSummarizationError:
+            raise
+        except Exception:
+            raise broker_error("broker_error") from None
+        return self._validated_result(result)
+
+    def reconcile(self, task_id: str, *, idempotency_key: str | None = None) -> str | None:
+        """Reconcile an operator-resolved task using GET only."""
+        result = self._client.reconcile_result(task_id, idempotency_key=idempotency_key)
+        if result is None:
+            return None
+        return self._validated_result(result)
+
+    def _operation(self, transcript: str) -> BrokerOperation:
+        return BrokerOperation(
             TRAFFIC_OPERATION_KIND,
             TRAFFIC_OPERATION_ORDINAL,
             SUMMARIZATION_SYSTEM_PROMPT,
             FINAL_SUMMARY_INSTRUCTIONS + "\n\nTRANSCRIPCION:\n\n" + transcript,
             self._profile.max_tokens,
         )
+
+    def _assert_request_size(self, operation: BrokerOperation) -> None:
         request_bytes = len(operation.system_prompt.encode("utf-8")) + len(operation.user_prompt.encode("utf-8"))
         if request_bytes > self._profile.max_request_content_bytes:
             raise broker_error("broker_input_too_large")
-        try:
-            result = self._client.submit_result(operation, idempotency_key(context, operation))
-        except BrokerSummarizationError:
-            raise
-        except Exception as exc:
-            raise broker_error("broker_error") from None
-        if not isinstance(result, BrokerResult):
-            raise broker_error("broker_protocol_error")
+
+    def _validated_result(self, result: BrokerResult) -> str:
         if result.finish_reason != self._profile.accepted_finish_reason:
             if result.finish_reason == "length":
                 raise broker_error("broker_output_incomplete")

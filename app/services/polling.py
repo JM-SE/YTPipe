@@ -23,6 +23,7 @@ from app.models.channel import Channel
 from app.models.mobile_push_delivery import MobilePushDelivery
 from app.models.notification_delivery import NotificationDelivery
 from app.models.oauth_account import OAuthAccount
+from app.models.pipeline_stage import PipelineStage
 from app.models.sync_state import SyncState
 from app.models.user import User
 from app.models.user_channel import UserChannel
@@ -37,6 +38,7 @@ from app.services.mobile_push import (
 from app.services.llama_recovery import LlamaRecoveryService
 from app.services.pipeline import SUMMARIZATION_PROCESS, PipelineDrainStats, PipelineService
 from app.services.summarization import SummarizationService
+from app.services.summary_route import summarization_route_name
 from app.services.telegram import TelegramDeliveryService
 from app.services.transcript import TranscriptService
 
@@ -157,6 +159,8 @@ class YouTubePollingService:
         channel_errors: list[dict[str, Any]] = []
 
         self._attempt_summary_recovery(session, user, summarization_state)
+        if self.pipeline_service is not None:
+            self.pipeline_service.reconcile_quarantined_summaries(session, user)
         self._drain_pending_pipeline_videos(session, user)
         self._process_pending_initial_deliveries(session, user)
         self._process_pending_retry_deliveries(session, user)
@@ -382,6 +386,48 @@ class YouTubePollingService:
         polling_state.last_error_message = message
         session.flush()
 
+    def request_quarantine_reconciliation(
+        self,
+        session: Session,
+        user: User,
+        stage_id: int,
+        *,
+        resolution_reference: str,
+        actor_source: str = "admin_bearer",
+    ) -> bool:
+        """Record an audited operator resolution and enable GET-only reconciliation.
+
+        The operator confirms resolution through a bounded reference; YTPipe
+        never queries or executes ``llm-broker worker resolve``. Only a
+        known-ID stage currently awaiting operator resolution may transition.
+        The audit record carries the actor source, resolved-at timestamp,
+        normalized bounded reference, stage ID, and transition outcome.
+        """
+        if self.pipeline_service is None or not resolution_reference.strip():
+            return False
+        stage = session.scalar(
+            select(PipelineStage).where(
+                PipelineStage.id == stage_id,
+                PipelineStage.user_id == user.id,
+                PipelineStage.stage == "summary",
+            )
+        )
+        if stage is None:
+            return False
+        if not self.pipeline_service.make_quarantine_get_eligible(stage):
+            return False
+        normalized = " ".join(resolution_reference.split())[:128]
+        audit = {
+            "actor_source": actor_source[:64],
+            "resolved_at": datetime.now(UTC).isoformat(),
+            "reference": normalized,
+            "stage_id": stage_id,
+            "outcome": "get_eligible",
+        }
+        stage.reconciliation_reason = json.dumps(audit, sort_keys=True, ensure_ascii=True)[:1024]
+        session.flush()
+        return True
+
     @staticmethod
     def _load_summary_circuit_state(
         pipeline_service: PipelineService | None,
@@ -390,13 +436,15 @@ class YouTubePollingService:
         if pipeline_service is None:
             return
         metadata = summarization_state.state_metadata or {}
-        pipeline_service.summary_paused = bool(metadata.get("paused", False))
-        pipeline_service.summary_pause_reason = metadata.get("last_error")
+        # Y02c makes the old process-wide pause non-authoritative. Keep the
+        # historical metadata for audit, but never let it block a new drain.
+        pipeline_service.summary_paused = False
+        pipeline_service.summary_pause_reason = None
         failure = metadata.get("summary_failure")
         target = failure.get("recovery_target") if isinstance(failure, dict) else None
-        pipeline_service._summary_recovery_target = target if target in {"direct_llama", "none"} else "direct_llama"
+        pipeline_service._summary_recovery_target = target if target in {"direct_llama", "none"} else "none"
         failed_video_id = metadata.get("failed_video_id")
-        pipeline_service.summary_pause_video_id = failed_video_id if isinstance(failed_video_id, int) else None
+        pipeline_service.summary_pause_video_id = None
 
     def _attempt_summary_recovery(
         self,
@@ -424,55 +472,86 @@ class YouTubePollingService:
         if self.pipeline_service is None:
             return
 
-        previous = summarization_state.state_metadata or {}
-        was_paused = bool(previous.get("paused", False))
-        is_paused = self.pipeline_service.summary_paused
-        metadata = dict(previous)
-        metadata["paused"] = is_paused
-
-        if is_paused:
-            reason = self.pipeline_service.summary_pause_reason or "Unknown summarization failure."
-            metadata["last_error"] = reason
-            metadata["last_failure_at"] = now.isoformat()
-            failure = dict(metadata.get("summary_failure") or {})
-            target = failure.get("recovery_target", "direct_llama")
-            failure["recovery_target"] = target if target in {"direct_llama", "none"} else "direct_llama"
-            metadata["summary_failure"] = failure
-            if not was_paused:
-                metadata["incident_started_at"] = now.isoformat()
-                metadata["alert_sent"] = False
-
-            restart_message = "Automatic llama.cpp restart is not configured."
-            if metadata["summary_failure"]["recovery_target"] == "none":
-                restart_message = "Automatic llama.cpp restart is not applicable to this failure."
-            elif self._restart_allowed(metadata, now):
-                result = self.llama_recovery_service.restart() if self.llama_recovery_service else None
-                if result is not None:
-                    metadata["restart_attempted_at"] = now.isoformat()
-                    metadata["restart_succeeded"] = result.succeeded
-                    restart_message = result.reason
-            elif metadata.get("restart_attempted_at"):
-                restart_message = "llama.cpp restart is waiting for the configured cooldown."
-
-            if not metadata.get("alert_sent", False):
-                if self._send_summary_alert(session, user, reason, restart_message):
-                    metadata["alert_sent"] = True
-
-            summarization_state.last_error_at = now
-            summarization_state.last_error_message = reason
+        metadata = dict(summarization_state.state_metadata or {})
+        metadata["paused"] = False
+        # Legacy pause metadata is retained as evidence, but all new incident
+        # handling is dependency-scoped and direct-route only.
+        if summarization_route_name(self.pipeline_service.summarization_service) == "direct":
+            self._finalize_direct_incident(session, user, summarization_state, metadata, now)
         else:
-            if self.pipeline_service.summary_recovery_succeeded or metadata.get("recovery_pending_alert"):
-                if self._send_summary_recovery_alert():
-                    metadata["recovery_pending_alert"] = False
-            metadata["alert_sent"] = False
-            metadata["paused"] = False
-            metadata.pop("summary_failure", None)
+            metadata.pop("direct_incident", None)
             summarization_state.last_success_at = now
             summarization_state.last_error_at = None
             summarization_state.last_error_message = None
 
         summarization_state.state_metadata = metadata
         session.flush()
+
+    def _finalize_direct_incident(
+        self,
+        session: Session,
+        user: User,
+        state: SyncState,
+        metadata: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        stage = session.scalar(
+            select(PipelineStage)
+            .where(
+                PipelineStage.user_id == user.id,
+                PipelineStage.stage == "summary",
+                PipelineStage.failure_code.like("direct_%"),
+                PipelineStage.status.in_(["pending_retry", "failed"]),
+            )
+            .order_by(PipelineStage.updated_at.desc())
+        )
+        if stage is None:
+            metadata.pop("direct_incident", None)
+            state.last_success_at = now
+            state.last_error_at = None
+            state.last_error_message = None
+            return
+        incident = dict(metadata.get("direct_incident") or {})
+        incident.setdefault("started_at", now.isoformat())
+        incident["failure_code"] = stage.failure_code
+        incident["last_error"] = stage.last_error
+        restart_message = "Reinicio automático de llama.cpp no configurado."
+        if self._restart_allowed(incident, now):
+            result = self.llama_recovery_service.restart() if self.llama_recovery_service else None
+            if result is not None:
+                incident["restart_attempted_at"] = now.isoformat()
+                incident["restart_succeeded"] = result.succeeded
+                restart_message = result.reason
+                if result.succeeded and self.pipeline_service.summarization_service is not None:
+                    probe_video = session.get(Video, stage.video_id)
+                    if probe_video is not None:
+                        stage.next_attempt_at = None
+                        self.pipeline_service._attempt_summary_stage(session, stage, probe_video)
+                        incident["probe_attempted_at"] = now.isoformat()
+                        incident["probe_succeeded"] = stage.status == "completed"
+        elif incident.get("restart_attempted_at"):
+            restart_message = "El reinicio de llama.cpp espera el cooldown configurado."
+        if not incident.get("alert_sent"):
+            if self._send_direct_summary_alert(user, stage.last_error or "Fallo directo controlado.", restart_message):
+                incident["alert_sent"] = True
+        metadata["direct_incident"] = incident
+        state.last_error_at = now
+        state.last_error_message = stage.last_error
+
+    def _send_direct_summary_alert(self, user: User, reason: str, restart_message: str) -> bool:
+        if self.telegram_service is None or not self.telegram_service.enabled:
+            return True
+        try:
+            self.telegram_service.send_message(
+                "⚠️ Fallo del servicio directo de resúmenes\n\n"
+                f"Causa: {reason}\n"
+                f"Recuperación: {restart_message}\n"
+                "El resto de videos continúa y este video queda en retry controlado."
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not send direct summary alert.")
+            return False
+        return True
 
     def _restart_allowed(self, metadata: dict[str, Any], now: datetime) -> bool:
         if self.llama_recovery_service is None or not self.llama_recovery_service.enabled:

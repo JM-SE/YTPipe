@@ -388,7 +388,8 @@ def test_plain_exception_defaults_direct_llama_on_direct_route() -> None:
     stage, video, session = _fake_stage_video()
     assert service._attempt_summary_stage(session, stage, video) is True
     assert stage.status == STATUS_PENDING_RETRY
-    assert service.summary_paused is True
+    assert service.summary_paused is False
+    assert service.summary_pause_reason is None
     assert service._summary_recovery_target == "direct_llama"
 
 
@@ -398,18 +399,19 @@ def test_plain_exception_defaults_none_on_broker_route(caplog: pytest.LogCapture
         # Simulate a broker-adapter bug outside the sanitized raises: an
         # exception WITHOUT recovery_target on the broker route must still
         # resolve to "none", never "direct_llama".
-        def _boom(transcript: str, *, context: SummaryGatewayContext | None = None) -> str:
+        def _boom(transcript: str, *, context: SummaryGatewayContext | None = None) -> object:
             raise RuntimeError("broker bug")
 
-        service.summarize = _boom  # type: ignore[method-assign]
+        service.submit_task = _boom  # type: ignore[method-assign]
         pipeline = PipelineService(summarization_service=service)  # type: ignore[arg-type]
         stage, video, session = _fake_stage_video()
         with caplog.at_level(logging.INFO, logger="app.services.pipeline"):
             assert pipeline._attempt_summary_stage(session, stage, video) is True
     finally:
         service.close()
-    assert stage.status == STATUS_PENDING_RETRY
-    assert pipeline.summary_paused is True
+    assert stage.status == "failed"
+    assert pipeline.summary_paused is False
+    assert pipeline.summary_pause_reason is None
     assert pipeline._summary_recovery_target == "none"
     records = [r for r in caplog.records if "summary_route_attributed" in r.getMessage()]
     assert len(records) == 1
@@ -425,7 +427,7 @@ def test_direct_failure_logs_sanitized_code(caplog: pytest.LogCaptureFixture) ->
     records = [r for r in caplog.records if "summary_failed" in r.getMessage()]
     assert len(records) == 1
     message = records[0].getMessage()
-    assert "code=direct_error" in message
+    assert "code=direct_transport_error" in message
     assert "route=direct" in message
     assert "direct boom" not in message
     assert "direct boom" not in caplog.text
@@ -439,17 +441,17 @@ def test_direct_failure_logs_sanitized_code(caplog: pytest.LogCaptureFixture) ->
 def test_broker_classified_failure_logs_its_code(caplog: pytest.LogCaptureFixture) -> None:
     service = _traffic_service(lambda request: _response(200, _succeeded_result()))
     try:
-        def _boom(transcript: str, *, context: SummaryGatewayContext | None = None) -> str:
+        def _boom(transcript: str, *, context: SummaryGatewayContext | None = None) -> object:
             raise BrokerSummarizationError("broker_output_incomplete")
 
-        service.summarize = _boom  # type: ignore[method-assign]
+        service.submit_task = _boom  # type: ignore[method-assign]
         pipeline = PipelineService(summarization_service=service)  # type: ignore[arg-type]
         stage, video, session = _fake_stage_video()
         with caplog.at_level(logging.INFO, logger="app.services.pipeline"):
             assert pipeline._attempt_summary_stage(session, stage, video) is True
     finally:
         service.close()
-    assert stage.status == STATUS_PENDING_RETRY
+    assert stage.status == "failed"
     records = [r for r in caplog.records if "summary_failed" in r.getMessage()]
     assert len(records) == 1
     message = records[0].getMessage()
@@ -467,10 +469,10 @@ def test_broker_unclassified_failure_logs_unknown_without_detail(
 ) -> None:
     service = _traffic_service(lambda request: _response(200, _succeeded_result()))
     try:
-        def _boom(transcript: str, *, context: SummaryGatewayContext | None = None) -> str:
+        def _boom(transcript: str, *, context: SummaryGatewayContext | None = None) -> object:
             raise ValueError("raw transport detail")
 
-        service.summarize = _boom  # type: ignore[method-assign]
+        service.submit_task = _boom  # type: ignore[method-assign]
         pipeline = PipelineService(summarization_service=service)  # type: ignore[arg-type]
         stage, video, session = _fake_stage_video()
         with caplog.at_level(logging.INFO, logger="app.services.pipeline"):
@@ -480,7 +482,7 @@ def test_broker_unclassified_failure_logs_unknown_without_detail(
     records = [r for r in caplog.records if "summary_failed" in r.getMessage()]
     assert len(records) == 1
     message = records[0].getMessage()
-    assert "code=broker_unknown" in message
+    assert "code=broker_protocol_error" in message
     assert "route=broker" in message
     assert "raw transport detail" not in message
     assert "raw transport detail" not in caplog.text
@@ -505,7 +507,7 @@ def test_broker_length_finish_maps_incomplete_end_to_end(
             assert pipeline._attempt_summary_stage(session, stage, video) is True
     finally:
         service.close()
-    assert stage.status == STATUS_PENDING_RETRY
+    assert stage.status == "failed"
     records = [r for r in caplog.records if "summary_failed" in r.getMessage()]
     assert len(records) == 1
     message = records[0].getMessage()

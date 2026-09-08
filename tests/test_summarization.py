@@ -83,5 +83,23 @@ def test_http_error_preserves_provider_detail(monkeypatch) -> None:
     )
     monkeypatch.setattr("app.services.summarization.httpx.post", lambda *args, **kwargs: response)
 
-    with pytest.raises(SummarizationRequestError, match="HTTP 500: Vulkan device lost"):
+    with pytest.raises(SummarizationRequestError, match="HTTP 500: Vulkan device lost") as exc:
         service.summarize("short transcript")
+    assert exc.value.code == "direct_http_error"
+    assert exc.value.failure_class == "transient"
+
+
+@pytest.mark.parametrize("payload", [[], {}, {"choices": []}, {"choices": [{"message": {}}]}])
+def test_malformed_direct_response_has_structured_error(monkeypatch, payload) -> None:
+    service = SummarizationService(Settings(DATABASE_URL="sqlite://"))
+    response = httpx.Response(
+        200,
+        json=payload,
+        request=httpx.Request("POST", "http://127.0.0.1:8001/v1/chat/completions"),
+    )
+    monkeypatch.setattr("app.services.summarization.httpx.post", lambda *args, **kwargs: response)
+
+    with pytest.raises(SummarizationRequestError) as exc:
+        service.summarize("short transcript")
+    assert exc.value.code == "direct_invalid_response"
+    assert exc.value.failure_class == "transient"

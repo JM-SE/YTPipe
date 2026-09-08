@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -362,7 +362,7 @@ class TestDependencyChain:
         )
         assert telegram_stage.status == STATUS_SKIPPED
 
-    def test_summary_infrastructure_failure_pauses_later_summaries(
+    def test_summary_infrastructure_failure_does_not_pause_later_summaries(
         self, db_session, user, channel, video, transcript_service, telegram_service
     ):
         transcript_service.fetch_transcript.return_value = "some transcript"
@@ -413,13 +413,103 @@ class TestDependencyChain:
             )
         )
 
-        assert svc.summary_paused is True
-        assert svc.summary_pause_reason == "Summarization server returned HTTP 500: Vulkan device lost."
+        assert svc.summary_paused is False
+        assert svc.summary_pause_reason is None
+        assert svc.summary_pause_video_id is None
         assert first_summary.status == STATUS_PENDING_RETRY
-        assert second_summary.status == STATUS_PENDING
+        assert second_summary.status == STATUS_PENDING_RETRY
         assert second_telegram.status == STATUS_PENDING
-        assert summarization_service.summarize.call_count == 1
+        assert summarization_service.summarize.call_count == 2
         assert transcript_service.fetch_transcript.call_count == 2
+
+    def test_quarantine_requires_explicit_resolution_and_reconciles_get_only(
+        self, db_session, user, video
+    ):
+        video.transcript = "existing transcript"
+        db_session.commit()
+        stage = PipelineStage(
+            video_id=video.id,
+            user_id=user.id,
+            stage=STAGE_SUMMARY,
+            status=STATUS_PENDING_RETRY,
+            quarantined_at=datetime.now(UTC),
+            reconciliation_status="awaiting_operator_resolution",
+            broker_task_id="opaque-task",
+            broker_idempotency_key="logical-key",
+        )
+        db_session.add(stage)
+        db_session.commit()
+        gateway = MagicMock()
+        gateway.reconcile.return_value = None
+        svc = make_pipeline_service(summarization_svc=gateway)
+
+        assert svc.reconcile_quarantined_summaries(db_session, user) == 0
+        gateway.reconcile.assert_not_called()
+        assert svc.make_quarantine_get_eligible(stage) is True
+        stage.next_reconcile_at = None
+        db_session.flush()
+        assert svc.reconcile_quarantined_summaries(db_session, user) == 0
+        gateway.reconcile.assert_called_once_with("opaque-task", idempotency_key="logical-key")
+        assert stage.next_reconcile_at is not None
+
+        gateway.reconcile.return_value = "Recovered summary"
+        stage.next_reconcile_at = None
+        db_session.commit()
+        assert svc.reconcile_quarantined_summaries(db_session, user) == 1
+        assert video.summary == "Recovered summary"
+
+    def test_quarantined_manual_content_returns_terminal_sanitized_result(
+        self, db_session, user, video
+    ):
+        video.transcript = "existing transcript"
+        db_session.add(
+            PipelineStage(
+                video_id=video.id,
+                user_id=user.id,
+                stage=STAGE_SUMMARY,
+                status=STATUS_PENDING_RETRY,
+                quarantined_at=datetime.now(UTC),
+                failure_class="indeterminate",
+                failure_code="broker_timeout",
+                reconciliation_reason="operator-reference-must-not-leak",
+            )
+        )
+        db_session.commit()
+        summarizer = MagicMock()
+        svc = make_pipeline_service(summarization_svc=summarizer)
+
+        result = svc.process_content_stages(db_session, user, video)
+
+        assert result.outcome == "failed"
+        assert "operator-reference-must-not-leak" not in (result.error or "")
+        assert "requiere reconciliación" in (result.error or "")
+        summarizer.summarize.assert_not_called()
+
+    def test_quarantine_without_task_id_sends_one_sanitized_notice(self, db_session, user, channel, video):
+        stage = PipelineStage(
+            video_id=video.id,
+            user_id=user.id,
+            stage=STAGE_SUMMARY,
+            status=STATUS_PENDING_RETRY,
+            quarantined_at=datetime.now(UTC),
+            reconciliation_status="awaiting_operator_resolution",
+            failure_class="indeterminate",
+            failure_code="broker_timeout",
+            reconciliation_reason="https://internal.example/task/opaque-token",
+        )
+        db_session.add(stage)
+        db_session.commit()
+        telegram = MagicMock()
+        svc = make_pipeline_service(telegram_svc=telegram)
+
+        assert svc._attempt_fallback_telegram(db_session, user, channel, video, {STAGE_SUMMARY: stage}) is True
+        assert svc._attempt_fallback_telegram(db_session, user, channel, video, {STAGE_SUMMARY: stage}) is False
+        telegram.send_message.assert_called_once()
+        message = telegram.send_message.call_args.args[0]
+        assert "Resumen no disponible" in message
+        assert "broker_timeout" not in message
+        assert "task" not in message.lower()
+        assert "internal.example" not in message
 
     def test_summary_recovery_closes_circuit(self, db_session, user, channel, video, telegram_service):
         video.transcript = "existing transcript"

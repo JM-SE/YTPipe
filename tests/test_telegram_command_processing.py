@@ -144,11 +144,12 @@ def test_manual_content_stages_do_not_create_automatic_telegram_stage(db_session
     assert STAGE_TELEGRAM not in stages
 
 
-def test_open_summary_circuit_still_fetches_transcript_for_recovery(db_session) -> None:
+def test_legacy_open_summary_circuit_does_not_block_new_processing(db_session) -> None:
     user, video = add_owner_and_video(db_session)
     transcript = MagicMock()
     transcript.fetch_transcript.return_value = "Transcript"
     summarizer = MagicMock()
+    summarizer.summarize.return_value = None
     service = PipelineService(
         transcript_service=transcript,
         summarization_service=summarizer,
@@ -160,7 +161,7 @@ def test_open_summary_circuit_still_fetches_transcript_for_recovery(db_session) 
     assert isinstance(result, ContentProcessingResult)
     assert result.outcome == "pending_retry"
     transcript.fetch_transcript.assert_called_once()
-    summarizer.summarize.assert_not_called()
+    summarizer.summarize.assert_called_once()
     assert set(db_session.scalars(select(PipelineStage.stage)).all()) == {
         STAGE_TRANSCRIPT,
         STAGE_SUMMARY,
@@ -338,3 +339,164 @@ def test_request_specific_telegram_reply_uses_reply_parameters_and_validates_suc
         assert exc.retryable is True
     else:
         raise AssertionError("malformed Telegram success was accepted")
+
+
+def test_quarantined_summary_command_terminalizes_once_with_canonical_reply(db_session, monkeypatch) -> None:
+    """A quarantined manual /summary is terminal after one content attempt: no
+    30-second processing loop, no fallback stage, and reply delivery retries
+    until exactly one canonical sanitized message is sent."""
+    user, video = add_owner_and_video(db_session)
+    stage = PipelineStage(
+        video_id=video.id,
+        user_id=user.id,
+        stage=STAGE_SUMMARY,
+        status="pending_retry",
+        quarantined_at=datetime.now(UTC),
+        reconciliation_status="awaiting_operator_resolution",
+        failure_class="indeterminate",
+        failure_code="broker_timeout",
+        reconciliation_reason="El broker no confirmó el resultado dentro del plazo.",
+    )
+    db_session.add(stage)
+    db_session.commit()
+    request = add_request(db_session, video_id=video.id)
+    settings = command_settings()
+
+    attempts = 0
+    calls = []
+
+    def fake_process(self, session, user, video):
+        nonlocal attempts
+        attempts += 1
+        return ContentProcessingResult(
+            "failed",
+            "Resumen no disponible. Motivo: El broker no confirmó el resultado dentro del plazo; "
+            "requiere reconciliación. Estado: requiere resolución operativa antes de continuar.",
+        )
+
+    monkeypatch.setattr(
+        "app.services.telegram_command_queue.YouTubeVideoMetadataService.resolve_and_upsert",
+        lambda self, session, **kwargs: video,
+    )
+    monkeypatch.setattr(PipelineService, "process_content_stages", fake_process)
+
+    failures = iter(
+        [
+            TelegramDeliveryAttemptError("telegram timeout", retryable=True),
+            TelegramDeliveryResult(provider_message_id=903),
+        ]
+    )
+
+    def send_reply(self, text, *, chat_id, reply_to_message_id):
+        calls.append(text)
+        value = next(failures)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(
+        "app.services.telegram_command_queue.TelegramDeliveryService.send_message_to_chat",
+        send_reply,
+    )
+
+    service = TelegramCommandQueueService(settings, db_session)
+    first = service.process_next()
+    assert first.claimed is True
+    assert attempts == 1
+    stored = db_session.get(TelegramCommandRequest, request.id)
+    assert stored is not None
+    assert stored.status == "failed"
+    assert stored.reply_status == "pending"
+
+    # Reply delivery retries once, then succeeds exactly once.
+    second = service.process_next()
+    stored = db_session.get(TelegramCommandRequest, request.id)
+    assert stored.reply_status == "pending_retry"
+    assert stored.reply_attempt_count == 1
+    stored.reply_next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+    db_session.commit()
+
+    third = service.process_next()
+    stored = db_session.get(TelegramCommandRequest, request.id)
+    assert stored.reply_status == "sent"
+    assert stored.telegram_reply_message_id == 903
+
+    assert attempts == 1  # content processing never ran again
+    # Two delivery attempts (one retryable failure + one success) but always
+    # the same canonical sanitized message: no duplicated content.
+    assert len(calls) == 2
+    assert len(set(calls)) == 1
+    message = calls[0]
+    assert "Resumen no disponible" in message
+    assert "requiere reconciliación" in message
+    assert "opaque" not in message
+    assert "t-1" not in message
+
+    # No automatic fallback/notification stage was created.
+    stages = {s.stage for s in db_session.scalars(select(PipelineStage)).all()}
+    assert STAGE_TELEGRAM not in stages
+    assert "fallback_telegram" not in stages
+
+
+def test_stale_reply_lease_keeps_canonical_failure_message(db_session, monkeypatch) -> None:
+    """A stale `sending` reply lease must not clobber the canonical sanitized
+    failure message: after lease recovery the retry delivers the same canonical
+    text, not the generic fallback."""
+    _user, video = add_owner_and_video(db_session)
+    canonical = (
+        "Resumen no disponible. Motivo: El broker no confirmó el resultado dentro del plazo; "
+        "requiere reconciliación. Estado: requiere resolución operativa antes de continuar."
+    )
+    request = add_request(
+        db_session,
+        status="failed",
+        reply_status="sending",
+        video_id=video.id,
+    )
+    request.last_error = canonical
+    request.reply_attempt_count = 1
+    request.reply_started_at = datetime.now(UTC) - timedelta(seconds=5)
+    request.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    db_session.commit()
+
+    settings = command_settings()
+    calls: list[str] = []
+    failures = iter(
+        [
+            TelegramDeliveryAttemptError("telegram timeout", retryable=True),
+            TelegramDeliveryResult(provider_message_id=905),
+        ]
+    )
+
+    def send_reply(self, text, *, chat_id, reply_to_message_id):
+        calls.append(text)
+        value = next(failures)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(
+        "app.services.telegram_command_queue.TelegramDeliveryService.send_message_to_chat",
+        send_reply,
+    )
+
+    service = TelegramCommandQueueService(settings, db_session)
+    first = service.process_next()
+    assert first.claimed is True
+
+    stored = db_session.get(TelegramCommandRequest, request.id)
+    # Lease recovery preserved the canonical message for the retry.
+    assert stored.reply_status == "pending_retry"
+    assert stored.last_error == canonical
+
+    stored.reply_next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
+    db_session.commit()
+
+    second = service.process_next()
+    stored = db_session.get(TelegramCommandRequest, request.id)
+    assert stored.reply_status == "sent"
+    assert stored.telegram_reply_message_id == 905
+
+    # Both delivery attempts carried the same canonical message: no generic
+    # fallback, no duplicated content.
+    assert calls == [canonical, canonical]

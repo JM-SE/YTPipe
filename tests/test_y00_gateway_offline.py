@@ -190,6 +190,9 @@ def test_broker_valid_terminal_errors_are_sanitized(state: str) -> None:
         with pytest.raises(BrokerSummarizationError) as exc:
             svc.summarize("short", context=SummaryGatewayContext(1))
         assert exc.value.code == f"broker_task_{state}"
+        if state == "failed":
+            assert exc.value.failure_class == "backend_rejected"
+            assert exc.value.broker_code == "backend_unavailable"
         assert str(exc.value) == "Broker summarization failed."
     finally:
         svc.close()
@@ -202,9 +205,78 @@ def test_broker_synchronous_terminal_failure_uses_result_envelope() -> None:
         with pytest.raises(BrokerSummarizationError) as exc:
             svc.summarize("short", context=SummaryGatewayContext(1))
         assert exc.value.code == "broker_task_failed"
+        assert exc.value.failure_class == "backend_rejected"
+        assert exc.value.broker_code == "backend_rejected"
         assert str(exc.value) == "Broker summarization failed."
     finally:
         svc.close()
+
+
+def test_broker_unknown_error_class_is_preserved_for_conservative_policy() -> None:
+    error = {"class": "future_backend_state", "code": "future_code", "message": "safe"}
+    svc = gateway(lambda request: response(200, json={"status": "failed", "error": error}))
+    try:
+        with pytest.raises(BrokerSummarizationError) as exc:
+            svc.summarize("short", context=SummaryGatewayContext(1))
+        assert exc.value.failure_class == "future_backend_state"
+        assert exc.value.broker_code == "future_code"
+    finally:
+        svc.close()
+
+
+def test_broker_missing_location_retains_key_without_replay() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request):
+        calls.append(request)
+        return response(202, json=task(), headers={})
+
+    svc = gateway(handler)
+    try:
+        with pytest.raises(BrokerSummarizationError) as exc:
+            svc.summarize("short", context=SummaryGatewayContext(99))
+        assert exc.value.code == "broker_location_invalid"
+        assert exc.value.idempotency_key
+        assert exc.value.task_id is None
+    finally:
+        svc.close()
+    assert [request.method for request in calls] == ["POST"]
+
+
+def test_reconcile_result_is_get_only_and_preserves_key_on_protocol_error() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request):
+        calls.append(request)
+        return response(200, json={"status": "unexpected"})
+
+    svc = gateway(handler)
+    try:
+        with pytest.raises(BrokerSummarizationError) as exc:
+            svc.reconcile_result("task-1", idempotency_key="logical-key")
+        assert exc.value.task_id == "task-1"
+        assert exc.value.idempotency_key == "logical-key"
+        assert exc.value.code == "broker_protocol_error"
+    finally:
+        svc.close()
+    assert [request.method for request in calls] == ["GET"]
+
+
+def test_reconcile_result_returns_success_without_post() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request):
+        calls.append(request)
+        return response(200, json=task_result())
+
+    svc = gateway(handler)
+    try:
+        result = svc.reconcile_result("task-1", idempotency_key="logical-key")
+        assert result is not None
+        assert result.content == VALID
+    finally:
+        svc.close()
+    assert [request.method for request in calls] == ["GET"]
 
 
 @pytest.mark.parametrize("value", [
@@ -327,7 +399,7 @@ def test_async_task_id_must_match_location() -> None:
         svc.close()
 
 
-def test_pipeline_persists_broker_recovery_target_none(db_session) -> None:
+def test_pipeline_does_not_persist_pause_on_broker_failure(db_session) -> None:
     user = User(email="y00@example.com")
     channel = Channel(youtube_channel_id="y00", title="Y00")
     video = Video(youtube_video_id="v", channel=channel, title="Video", published_at=datetime.now(UTC), transcript="text")
@@ -337,11 +409,15 @@ def test_pipeline_persists_broker_recovery_target_none(db_session) -> None:
     svc = PipelineService(summarization_service=type("Failing", (), {"summarize": lambda *_a, **_k: (_ for _ in ()).throw(BrokerSummarizationError("ignored"))})())
     assert svc._attempt_summary_stage(db_session, stage, video)
     assert stage.status == STATUS_PENDING_RETRY
+    assert svc.summary_paused is False
+    assert svc.summary_pause_reason is None
     assert svc._summary_recovery_target == "none"
-    assert stage.last_error == "Broker summarization failed."
+    assert stage.last_error == "El resumen no pudo generarse por un error controlado."
+    # No pause is opened, so there is nothing to persist: the failure stays
+    # per-video and later summaries are still attempted.
     svc._persist_summary_pause_state(db_session, user)
-    state = db_session.query(SyncState).filter_by(user_id=user.id, process_type=SUMMARIZATION_PROCESS).one()
-    assert state.state_metadata["summary_failure"]["recovery_target"] == "none"
+    state = db_session.query(SyncState).filter_by(user_id=user.id, process_type=SUMMARIZATION_PROCESS).one_or_none()
+    assert state is None
 
 
 def test_none_recovery_target_does_not_infer(db_session) -> None:

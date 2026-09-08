@@ -10,7 +10,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
-from app.services.broker_errors import broker_error
+from app.services.broker_errors import BrokerSummarizationError, broker_error
 from app.services.broker_summary import validate_broker_output
 from app.services.broker_profile import BrokerRequestProfile
 from app.services.summarization_gateway import SummaryGatewayContext, SummaryOperation, idempotency_key
@@ -25,6 +25,19 @@ class BrokerResult:
     content: str
     finish_reason: str
     usage: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedTask:
+    """Opaque accepted-task handle returned by a POST-only submission.
+
+    The caller (persistence owner) stores ``task_id`` and ``idempotency_key``
+    durably BEFORE issuing any result GET. The adapter never polls, never
+    performs session I/O, and never owns durable transitions.
+    """
+
+    task_id: str
+    idempotency_key: str
 
 
 class BrokerTaskClient:
@@ -65,6 +78,21 @@ class BrokerTaskClient:
 
     def submit_result(self, operation: BrokerOperation, idempotency_key_value: str) -> BrokerResult:
         return self._gateway._submit_result_with_key(operation, idempotency_key_value)
+
+    def submit_task(self, operation: BrokerOperation, idempotency_key_value: str) -> BrokerResult | AcceptedTask:
+        """POST only. Returns a validated sync result or an accepted-task handle."""
+        return self._gateway.submit_task(operation, idempotency_key_value)
+
+    def poll_result(self, task_id: str, idempotency_key_value: str) -> BrokerResult | None:
+        """Single GET result poll; None when the task is still pending."""
+        return self._gateway.poll_result(task_id, idempotency_key_value)
+
+    def reconcile_result(self, task_id: str, *, idempotency_key: str | None = None) -> BrokerResult | None:
+        return self._gateway.reconcile_result(task_id, idempotency_key=idempotency_key)
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self._gateway._timeout
 
 
 class BrokerSummarizationGateway:
@@ -114,6 +142,38 @@ class BrokerSummarizationGateway:
             raise broker_error("broker_output_invalid") from None
 
     def _submit_result_with_key(self, operation: SummaryOperation, key: str) -> BrokerResult:
+        """Blocking submit-then-poll convenience (probe/dormant gateway path).
+
+        The pipeline persistence owner must NOT use this fused method: it uses
+        ``submit_task`` + ``poll_result`` so the task handle is durably stored
+        before the first result GET.
+        """
+        deadline = self._clock() + self._timeout
+        accepted = self.submit_task(operation, key)
+        if isinstance(accepted, BrokerResult):
+            return accepted
+        task_id = accepted.task_id
+        for _ in range(math.ceil(self._timeout)):
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise broker_error("broker_timeout", task_id=task_id, idempotency_key=key)
+            self._sleep(min(1.0, remaining))
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise broker_error("broker_timeout", task_id=task_id, idempotency_key=key)
+            polled = self.poll_result(task_id, key, timeout=remaining)
+            if polled is None:
+                continue
+            return polled
+        raise broker_error("broker_timeout", task_id=task_id, idempotency_key=key)
+
+    def submit_task(self, operation: SummaryOperation, key: str) -> BrokerResult | AcceptedTask:
+        """POST only: returns a validated sync result or an accepted-task handle.
+
+        Never polls. Pre-Location errors carry only the idempotency key;
+        post-Location validation/protocol errors carry both task ID and key so
+        the persistence owner can durably quarantine the correct correlation.
+        """
         profile = self._profile
         generation: dict[str, object] = {
             "max_tokens": operation.max_tokens,
@@ -134,48 +194,66 @@ class BrokerSummarizationGateway:
         deadline = self._clock() + self._timeout
         remaining = deadline - self._clock()
         if remaining <= 0:
-            raise broker_error("broker_timeout")
+            raise broker_error("broker_timeout", idempotency_key=key)
         try:
             response = self._request("POST", "/v1/tasks", key=key, json=body, prefer=True,
                                     timeout=remaining)
         except (httpx.HTTPError, ValueError):
-            raise broker_error("broker_transport_error") from None
+            raise broker_error("broker_transport_error", idempotency_key=key) from None
         if deadline - self._clock() <= 0:
-            raise broker_error("broker_timeout")
+            raise broker_error("broker_timeout", idempotency_key=key)
         if response.status_code == 200:
-            state = _task_result_status(response)
-            if state == "succeeded":
-                return self._validated_result(response)
-            if state in {"failed", "cancelled", "expired"}:
-                raise broker_error(f"broker_task_{state}")
-            raise broker_error("broker_protocol_error")
-        if response.status_code not in (201, 202):
-            raise broker_error(_problem_code(response))
-        task_id = self._location_id(response)
-        _validate_task(_json_dict(response), task_id)
-        for _ in range(math.ceil(self._timeout)):
-            remaining = deadline - self._clock()
-            if remaining <= 0:
-                raise broker_error("broker_timeout")
-            self._sleep(min(1.0, remaining))
-            remaining = deadline - self._clock()
-            if remaining <= 0:
-                raise broker_error("broker_timeout")
             try:
-                polled = self._request("GET", f"/v1/tasks/{task_id}/result", timeout=remaining)
-            except httpx.HTTPError:
-                raise broker_error("broker_transport_error") from None
-            if polled.status_code != 200:
-                raise broker_error(_problem_code(polled))
-            state = _task_result_status(polled)
-            if state == "pending":
-                continue
+                state = _task_result_status(response)
+            except BrokerSummarizationError as exc:
+                exc.idempotency_key = key
+                raise
             if state == "succeeded":
-                return self._validated_result(polled)
+                try:
+                    return self._validated_result(response)
+                except BrokerSummarizationError as exc:
+                    exc.idempotency_key = key
+                    raise
             if state in {"failed", "cancelled", "expired"}:
-                raise broker_error(f"broker_task_{state}")
-            raise broker_error("broker_protocol_error")
-        raise broker_error("broker_timeout")
+                raise _terminal_task_error(response, state, idempotency_key=key)
+            raise broker_error("broker_protocol_error", idempotency_key=key)
+        if response.status_code not in (201, 202):
+            raise broker_error(_problem_code(response), idempotency_key=key)
+        task_id = self._location_id(response, idempotency_key=key)
+        try:
+            _validate_task(_json_dict(response), task_id)
+        except BrokerSummarizationError as exc:
+            exc.task_id = task_id
+            exc.idempotency_key = key
+            raise
+        return AcceptedTask(task_id=task_id, idempotency_key=key)
+
+    def poll_result(self, task_id: str, key: str, *, timeout: float | None = None) -> BrokerResult | None:
+        """Single GET result poll; None while the task is still pending."""
+        try:
+            polled = self._request("GET", f"/v1/tasks/{task_id}/result", timeout=timeout or self._timeout)
+        except httpx.HTTPError:
+            raise broker_error("broker_transport_error", task_id=task_id, idempotency_key=key) from None
+        if polled.status_code != 200:
+            raise broker_error(_problem_code(polled), task_id=task_id, idempotency_key=key)
+        try:
+            state = _task_result_status(polled)
+        except BrokerSummarizationError as exc:
+            exc.task_id = task_id
+            exc.idempotency_key = key
+            raise
+        if state == "pending":
+            return None
+        if state == "succeeded":
+            try:
+                return self._validated_result(polled)
+            except BrokerSummarizationError as exc:
+                exc.task_id = task_id
+                exc.idempotency_key = key
+                raise
+        if state in {"failed", "cancelled", "expired"}:
+            raise _terminal_task_error(polled, state, task_id=task_id, idempotency_key=key)
+        raise broker_error("broker_protocol_error", task_id=task_id, idempotency_key=key)
 
     def _request(self, method: str, path: str, *, key: str | None = None,
                  json: object = None, prefer: bool = False, timeout: float | None = None) -> httpx.Response:
@@ -185,6 +263,31 @@ class BrokerSummarizationGateway:
         if prefer:
             headers["Prefer"] = "wait=30"
         return self._client.request(method, path, headers=headers, json=json, timeout=timeout or self._timeout)
+
+    def reconcile_result(self, task_id: str, *, idempotency_key: str | None = None) -> BrokerResult | None:
+        """Read an existing task result without submitting or replaying work."""
+        try:
+            response = self._request("GET", f"/v1/tasks/{task_id}/result")
+        except httpx.HTTPError:
+            raise broker_error("broker_transport_error", task_id=task_id, idempotency_key=idempotency_key) from None
+        if response.status_code != 200:
+            raise broker_error(_problem_code(response), task_id=task_id, idempotency_key=idempotency_key)
+        try:
+            state = _task_result_status(response)
+        except BrokerSummarizationError as exc:
+            exc.task_id = task_id
+            exc.idempotency_key = idempotency_key
+            raise
+        if state == "pending":
+            return None
+        if state == "succeeded":
+            try:
+                return self._validated_result(response)
+            except BrokerSummarizationError as exc:
+                exc.task_id = task_id
+                exc.idempotency_key = idempotency_key
+                raise
+        raise _terminal_task_error(response, state, task_id=task_id, idempotency_key=idempotency_key)
 
     @staticmethod
     def _validated_result(response: httpx.Response) -> BrokerResult:
@@ -202,25 +305,25 @@ class BrokerSummarizationGateway:
         usage = result["usage"]
         return BrokerResult(text, result["finish_reason"], usage)
 
-    def _location_id(self, response: httpx.Response) -> str:
+    def _location_id(self, response: httpx.Response, *, idempotency_key: str | None = None) -> str:
         location = response.headers.get("Location")
         if not location:
-            raise broker_error("broker_location_invalid")
+            raise broker_error("broker_location_invalid", idempotency_key=idempotency_key)
         parsed = urlparse(location)
         base = urlparse(self._base_url)
         if parsed.scheme or parsed.netloc:
             if (parsed.scheme, parsed.netloc) != (base.scheme, base.netloc):
-                raise broker_error("broker_location_invalid")
+                raise broker_error("broker_location_invalid", idempotency_key=idempotency_key)
         if parsed.query or parsed.fragment or parsed.params:
-            raise broker_error("broker_location_invalid")
+            raise broker_error("broker_location_invalid", idempotency_key=idempotency_key)
         decoded_path = unquote(parsed.path)
         if decoded_path != parsed.path or "\\" in decoded_path:
-            raise broker_error("broker_location_invalid")
+            raise broker_error("broker_location_invalid", idempotency_key=idempotency_key)
         resolved = urlparse(urljoin(self._base_url + "/", location))
         parts = resolved.path.split("/")
         task_id = parts[3] if len(parts) == 4 and parts[:3] == ["", "v1", "tasks"] else ""
         if not task_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", task_id):
-            raise broker_error("broker_location_invalid")
+            raise broker_error("broker_location_invalid", idempotency_key=idempotency_key)
         return task_id
 
 
@@ -304,19 +407,39 @@ def _validate_classified_error(value: object) -> None:
         raise broker_error("broker_protocol_error")
     if not all(isinstance(value[key], str) and value[key] for key in ("class", "code", "message")):
         raise broker_error("broker_protocol_error")
-    if value["class"] not in {
-        "client_invalid",
-        "policy_rejected",
-        "backend_rejected",
-        "output_invalid",
-        "transient_unsent",
-        "transient_safe",
-        "indeterminate",
-        "internal",
-    }:
+    # Preserve well-formed future classes so YTPipe can quarantine them
+    # conservatively instead of incorrectly terminalizing a new broker state.
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", value["class"]):
         raise broker_error("broker_protocol_error")
 
 
+def _terminal_task_error(
+    response: httpx.Response,
+    state: str,
+    *,
+    task_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> Exception:
+    payload = _json_dict(response)
+    error = payload.get("error")
+    if state == "failed" and isinstance(error, dict):
+        failure_class = error.get("class")
+        broker_code = error.get("code")
+        if isinstance(failure_class, str) and isinstance(broker_code, str):
+            return broker_error(
+                f"broker_task_{state}",
+                failure_class=failure_class,
+                broker_code=broker_code,
+                task_id=task_id,
+                idempotency_key=idempotency_key,
+            )
+    return broker_error(
+        f"broker_task_{state}",
+        failure_class="terminal",
+        broker_code=f"task_{state}",
+        task_id=task_id,
+        idempotency_key=idempotency_key,
+    )
 def _problem_code(response: httpx.Response) -> str:
     try:
         payload = response.json()

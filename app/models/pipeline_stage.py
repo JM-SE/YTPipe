@@ -20,7 +20,19 @@ class PipelineStage(TimestampMixin, Base):
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failure_class: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    failure_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    quarantined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reconciliation_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    next_reconcile_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reconciliation_alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reconciliation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Broker identifiers are opaque protected correlation material. They are
+    # intentionally not exposed through the model's API or indexed for lookup.
+    broker_task_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    broker_idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     video = relationship("Video")
     user = relationship("User")

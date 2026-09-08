@@ -1,10 +1,11 @@
 # Y01 Broker Safe Connectivity and Controlled Acceptance Specification
 
-**Status:** `implemented_offline_verified_acceptance_blocked_on_H03`. Y01
-implementation and offline review exist, and manual synthetic connectivity
-succeeded. Y01 is **not accepted**: final real-URL acceptance is blocked on
-accepted/implemented broker H03 and separate operational approval. This remains
-a narrow connectivity gate, not product broker activation. It depends on
+**Status:** `accepted` 2026-09-05. Y01 implementation, offline review, and
+final real-URL acceptance are complete: accepted/implemented broker H03
+(`4a5227d` + fix `0eb9ebc`), compatibility desired/effective PASS with the same
+semantic manifest digest, synthetic PASS, and exactly one consented URL probe
+PASS on a disposable stack with no production deployment. Y01 remains a narrow
+connectivity gate, not product broker activation. It depends on
 accepted Y00 commit `ff05558` and does not redefine Y00. YTPipe baseline
 `8ae6aa5` is context, not acceptance evidence.
 
