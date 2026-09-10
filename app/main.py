@@ -64,6 +64,12 @@ def create_app(settings_override: Settings | None = None) -> FastAPI:
         openapi_url=None,
         lifespan=lifespan,
     )
+    if settings_override is not None:
+        # Keep every route dependency on the same explicit settings object as
+        # the app factory. This is primarily used by isolated tests and
+        # prevents protected endpoints from consulting the process-global
+        # settings instance.
+        app.dependency_overrides[get_settings] = lambda: settings
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

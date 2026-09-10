@@ -17,6 +17,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        populate_by_name=True,
     )
 
     app_name: str = Field(default="ytpipe", alias="APP_NAME")

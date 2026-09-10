@@ -150,7 +150,7 @@ def test_synthetic_probe_uses_fixed_payload_and_returns_sanitized_result() -> No
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return _response(200, _result(), request)
+        return _response(200, _result(), request, headers={"Location": "/v1/tasks/probe-task"})
 
     client = _client(handler)
     try:
@@ -173,7 +173,7 @@ def test_synthetic_probe_reports_output_validation_separately() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         invalid = _result()
         invalid["result"]["content"] = "respuesta libre"
-        return _response(200, invalid, request)
+        return _response(200, invalid, request, headers={"Location": "/v1/tasks/probe-task"})
 
     client = _client(handler)
     try:
@@ -252,7 +252,7 @@ def test_probe_maps_length_finish_reason_to_incomplete() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         result = _result()
         result["result"]["finish_reason"] = "length"
-        return _response(200, result, request)
+        return _response(200, result, request, headers={"Location": "/v1/tasks/probe-task"})
 
     client = _client(handler)
     try:
@@ -410,7 +410,14 @@ def test_synthetic_probe_rejects_oversized_request_without_submit() -> None:
 
 
 def test_youtube_probe_does_not_persist_or_invoke_pipeline() -> None:
-    client = _client(lambda request: _response(200, _result(), request))
+    client = _client(
+        lambda request: _response(
+            200,
+            _result(),
+            request,
+            headers={"Location": "/v1/tasks/probe-task"},
+        )
+    )
 
     class Transcript:
         def fetch_transcript_result(self, video_id: str) -> TranscriptFetchResult:
