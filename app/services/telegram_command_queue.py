@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.settings import Settings
 from app.models.oauth_account import OAuthAccount
+from app.models.pipeline_stage import PipelineStage
 from app.models.sync_state import SyncState
 from app.models.telegram_command_request import TelegramCommandRequest
 from app.models.user import User
@@ -20,6 +21,7 @@ from app.services.llama_recovery import LlamaRecoveryService
 from app.services.pipeline import PipelineService
 from app.services.summary_route import build_routed_summarization_gateway, close_routed_summarization_gateway
 from app.services.telegram import TelegramDeliveryAttemptError, TelegramDeliveryService
+from app.services.telegram_failure_notice import format_persisted_summary_failure
 from app.services.transcript import TranscriptService
 from app.services.youtube_video_metadata import YouTubeMetadataError, YouTubeVideoMetadataService
 
@@ -212,7 +214,8 @@ class TelegramCommandQueueService:
         for request in reply_rows:
             request.reply_status = "failed"
             request.reply_next_attempt_at = None
-            request.last_error = "Telegram reply attempts were exhausted."
+            # Reply transport exhaustion must not replace the persisted
+            # content-stage failure reason used for the canonical message.
         self.session.flush()
 
     def _claim(self, request: TelegramCommandRequest, kind: str, token: str) -> None:
@@ -384,7 +387,6 @@ class TelegramCommandQueueService:
                 "reply_status": "sent",
                 "reply_sent_at": datetime.now(UTC),
                 "telegram_reply_message_id": result.provider_message_id,
-                "last_error": None,
             },
         ):
             return
@@ -558,8 +560,7 @@ class TelegramCommandQueueService:
         state.state_metadata = metadata
         self.session.flush()
 
-    @staticmethod
-    def _reply_message(request: TelegramCommandRequest) -> str:
+    def _reply_message(self, request: TelegramCommandRequest) -> str:
         if request.status == "completed":
             video = request.video
             summary = video.summary if video is not None else None
@@ -569,8 +570,19 @@ class TelegramCommandQueueService:
         if request.status == "rejected":
             return "No pude procesar esta solicitud. Revisa la URL o la configuración actual."
         if request.status == "failed":
-            if request.last_error and request.last_error.startswith("Resumen no disponible."):
-                return _truncate_telegram_text(request.last_error)
+            stage = None
+            if request.video_id is not None:
+                stage = self.session.scalar(
+                    select(PipelineStage).where(
+                        PipelineStage.video_id == request.video_id,
+                        PipelineStage.stage == "summary",
+                    )
+                )
+            if stage is not None and stage.failure_code:
+                return format_persisted_summary_failure(
+                    failure_code=stage.failure_code,
+                    quarantined=stage.quarantined_at is not None,
+                )
             return "No se pudo completar el resumen de este video."
         return "No se pudo completar la solicitud."
 

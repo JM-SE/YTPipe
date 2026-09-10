@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base_class import Base, TimestampMixin
@@ -10,6 +10,10 @@ class PipelineStage(TimestampMixin, Base):
     __tablename__ = "pipeline_stages"
     __table_args__ = (
         UniqueConstraint("video_id", "user_id", "stage", name="uq_pipeline_stages_video_user_stage"),
+        CheckConstraint(
+            "broker_submission_epoch >= 0 AND broker_submission_epoch <= max_attempts",
+            name="ck_pipeline_stages_broker_submission_epoch_bounded",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -19,6 +23,14 @@ class PipelineStage(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(50), default="pending", nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    # Counts new broker submission generations, not attempts inside a broker
+    # task. Epoch zero preserves the pre-Y02d idempotency key.
+    broker_submission_epoch: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    # Bounded, sanitized terminal facts for prior broker generations. Payloads
+    # and provider bodies are never stored here.
+    broker_submission_history: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failure_class: Mapped[str | None] = mapped_column(String(50), nullable=True)

@@ -5,7 +5,8 @@ from app.services.broker_gateway import AcceptedTask, BrokerOperation, BrokerRes
 from app.services.broker_profile import BrokerRequestProfile, load_y01_profile
 from app.services.broker_summary import validate_broker_output
 from app.services.summarization import FINAL_SUMMARY_INSTRUCTIONS, SUMMARIZATION_SYSTEM_PROMPT
-from app.services.summarization_gateway import SummaryGatewayContext, idempotency_key
+from app.services.broker_idempotency import broker_idempotency_key
+from app.services.summarization_gateway import SummaryGatewayContext
 
 TRAFFIC_OPERATION_KIND = "traffic"
 TRAFFIC_OPERATION_ORDINAL = 0
@@ -48,27 +49,45 @@ class BrokerTrafficSummarizationService:
 
     def idempotency_key_for(self, transcript: str, context: SummaryGatewayContext) -> str:
         operation = self._operation(transcript)
-        return idempotency_key(context, operation)
+        return broker_idempotency_key(context, operation)
 
-    def submit_task(self, transcript: str, *, context: SummaryGatewayContext) -> AcceptedTask | str:
-        """POST only. Returns a validated summary for sync-200 or an accepted handle."""
+    def submit_task(self, transcript: str, *, context: SummaryGatewayContext) -> AcceptedTask:
+        """POST only. Return an accepted handle; the coordinator owns polling."""
         if context is None:
             raise broker_error("broker_context_missing")
         operation = self._operation(transcript)
         self._assert_request_size(operation)
         try:
-            accepted = self._client.submit_task(operation, idempotency_key(context, operation))
+            accepted = self._client.submit_task(operation, broker_idempotency_key(context, operation))
         except BrokerSummarizationError:
             raise
         except Exception:
-            raise broker_error("broker_error") from None
-        if isinstance(accepted, BrokerResult):
-            return self._validated_result(accepted)
+            raise broker_error(
+                "broker_task_indeterminate",
+                idempotency_key=broker_idempotency_key(context, operation),
+            ) from None
+        if not isinstance(accepted, AcceptedTask):
+            raise broker_error("broker_protocol_error")
         return accepted
 
-    def poll_task(self, task_id: str, *, idempotency_key_value: str) -> str | None:
+    def poll_task(
+        self,
+        task_id: str,
+        *,
+        idempotency_key_value: str,
+        timeout: float | None = None,
+    ) -> str | None:
         """Single GET result poll; None while the task is still pending."""
-        result = self._client.poll_result(task_id, idempotency_key_value)
+        try:
+            result = self._client.poll_result(task_id, idempotency_key_value, timeout=timeout)
+        except BrokerSummarizationError:
+            raise
+        except Exception:
+            raise broker_error(
+                "broker_task_indeterminate",
+                task_id=task_id,
+                idempotency_key=idempotency_key_value,
+            ) from None
         if result is None:
             return None
         return self._validated_result(result)
@@ -86,7 +105,7 @@ class BrokerTrafficSummarizationService:
         operation = self._operation(transcript)
         self._assert_request_size(operation)
         try:
-            result = self._client.submit_result(operation, idempotency_key(context, operation))
+            result = self._client.submit_result(operation, broker_idempotency_key(context, operation))
         except BrokerSummarizationError:
             raise
         except Exception:

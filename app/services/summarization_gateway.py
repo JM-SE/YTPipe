@@ -10,6 +10,7 @@ CONTRACT_VERSION = "ytpipe-summary-v1"
 @dataclass(frozen=True, slots=True)
 class SummaryGatewayContext:
     stage_id: int
+    broker_submission_epoch: int = 0
 
 
 @dataclass(frozen=True, slots=True)

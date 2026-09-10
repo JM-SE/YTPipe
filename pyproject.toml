@@ -44,6 +44,7 @@ include = ["app*"]
     "alembic/versions/20260728_0009_add_telegram_command_requests.py",
     "alembic/versions/20260728_0010_expand_telegram_command_url.py",
     "alembic/versions/20260907_0011_add_pipeline_stage_recovery_state.py",
+    "alembic/versions/20260909_0012_add_broker_submission_epoch.py",
 ]
 
 [tool.pytest.ini_options]

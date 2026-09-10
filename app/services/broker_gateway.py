@@ -79,13 +79,23 @@ class BrokerTaskClient:
     def submit_result(self, operation: BrokerOperation, idempotency_key_value: str) -> BrokerResult:
         return self._gateway._submit_result_with_key(operation, idempotency_key_value)
 
-    def submit_task(self, operation: BrokerOperation, idempotency_key_value: str) -> BrokerResult | AcceptedTask:
-        """POST only. Returns a validated sync result or an accepted-task handle."""
+    def submit_task(self, operation: BrokerOperation, idempotency_key_value: str) -> AcceptedTask:
+        """POST only for persistence-owned pipeline submissions.
+
+        The pipeline deliberately uses the non-blocking broker response so the
+        accepted task correlation can be committed before any result GET.
+        """
         return self._gateway.submit_task(operation, idempotency_key_value)
 
-    def poll_result(self, task_id: str, idempotency_key_value: str) -> BrokerResult | None:
+    def poll_result(
+        self,
+        task_id: str,
+        idempotency_key_value: str,
+        *,
+        timeout: float | None = None,
+    ) -> BrokerResult | None:
         """Single GET result poll; None when the task is still pending."""
-        return self._gateway.poll_result(task_id, idempotency_key_value)
+        return self._gateway.poll_result(task_id, idempotency_key_value, timeout=timeout)
 
     def reconcile_result(self, task_id: str, *, idempotency_key: str | None = None) -> BrokerResult | None:
         return self._gateway.reconcile_result(task_id, idempotency_key=idempotency_key)
@@ -149,7 +159,7 @@ class BrokerSummarizationGateway:
         before the first result GET.
         """
         deadline = self._clock() + self._timeout
-        accepted = self.submit_task(operation, key)
+        accepted = self._submit_task_response(operation, key, prefer=True)
         if isinstance(accepted, BrokerResult):
             return accepted
         task_id = accepted.task_id
@@ -167,12 +177,29 @@ class BrokerSummarizationGateway:
             return polled
         raise broker_error("broker_timeout", task_id=task_id, idempotency_key=key)
 
-    def submit_task(self, operation: SummaryOperation, key: str) -> BrokerResult | AcceptedTask:
-        """POST only: returns a validated sync result or an accepted-task handle.
+    def submit_task(self, operation: SummaryOperation, key: str) -> AcceptedTask:
+        """POST only for the persistence-owned asynchronous protocol.
 
-        Never polls. Pre-Location errors carry only the idempotency key;
-        post-Location validation/protocol errors carry both task ID and key so
-        the persistence owner can durably quarantine the correct correlation.
+        No ``Prefer`` header is sent: the broker returns ``201`` with a
+        validated task envelope and ``Location``. The persistence owner stores
+        that correlation before issuing a result GET.
+        """
+        accepted = self._submit_task_response(operation, key, prefer=False)
+        if not isinstance(accepted, AcceptedTask):
+            raise broker_error("broker_protocol_error", idempotency_key=key)
+        return accepted
+
+    def _submit_task_response(
+        self,
+        operation: SummaryOperation,
+        key: str,
+        *,
+        prefer: bool,
+    ) -> BrokerResult | AcceptedTask:
+        """Parse one POST response for either blocking or durable callers.
+
+        The blocking path may consume a terminal ``200``; it still requires a
+        valid ``Location`` first so terminal errors retain task correlation.
         """
         profile = self._profile
         generation: dict[str, object] = {
@@ -196,27 +223,40 @@ class BrokerSummarizationGateway:
         if remaining <= 0:
             raise broker_error("broker_timeout", idempotency_key=key)
         try:
-            response = self._request("POST", "/v1/tasks", key=key, json=body, prefer=True,
+            response = self._request("POST", "/v1/tasks", key=key, json=body, prefer=prefer,
                                     timeout=remaining)
         except (httpx.HTTPError, ValueError):
             raise broker_error("broker_transport_error", idempotency_key=key) from None
         if deadline - self._clock() <= 0:
             raise broker_error("broker_timeout", idempotency_key=key)
         if response.status_code == 200:
+            task_id = self._location_id(response, idempotency_key=key)
+            if not prefer:
+                # The persistence-owned submission is asynchronous-only. A
+                # terminal 200 here is a broker contract mismatch, not a
+                # business result the coordinator may consume. Keep the
+                # validated correlation for GET-only operator resolution.
+                raise broker_error(
+                    "broker_protocol_error",
+                    task_id=task_id,
+                    idempotency_key=key,
+                )
             try:
                 state = _task_result_status(response)
             except BrokerSummarizationError as exc:
+                exc.task_id = task_id
                 exc.idempotency_key = key
                 raise
             if state == "succeeded":
                 try:
                     return self._validated_result(response)
                 except BrokerSummarizationError as exc:
+                    exc.task_id = task_id
                     exc.idempotency_key = key
                     raise
             if state in {"failed", "cancelled", "expired"}:
-                raise _terminal_task_error(response, state, idempotency_key=key)
-            raise broker_error("broker_protocol_error", idempotency_key=key)
+                raise _terminal_task_error(response, state, task_id=task_id, idempotency_key=key)
+            raise broker_error("broker_protocol_error", task_id=task_id, idempotency_key=key)
         if response.status_code not in (201, 202):
             raise broker_error(_problem_code(response), idempotency_key=key)
         task_id = self._location_id(response, idempotency_key=key)

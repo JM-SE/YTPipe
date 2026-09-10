@@ -940,7 +940,10 @@ class PipelineService:
             stage.id,
             video.id,
         )
-        context = SummaryGatewayContext(stage_id=stage.id)
+        context = SummaryGatewayContext(
+            stage_id=stage.id,
+            broker_submission_epoch=getattr(stage, "broker_submission_epoch", 0),
+        )
         coordinator = BrokerSubmissionCoordinator(
             self.summarization_service,
             timeout_seconds=getattr(self.summarization_service, "timeout_seconds", None),

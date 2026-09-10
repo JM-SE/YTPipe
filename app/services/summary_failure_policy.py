@@ -24,6 +24,9 @@ _BROKER_QUARANTINE_CODES = {
     "broker_timeout",
     "broker_transport_error",
     "broker_task_indeterminate",
+    # A missing or malformed Location cannot prove whether the POST created a
+    # task, so it is an ambiguity even though no task ID is available.
+    "broker_location_invalid",
 }
 _BROKER_TERMINAL_CODES = {
     "broker_output_invalid",
@@ -72,7 +75,14 @@ def classify_summary_failure(
         )
     if attempt_count >= safe_attempts:
         return SummaryFailureOutcome(
-            route, "transient", code, "terminal", None, "ytpipe", "none", _display_reason(code)
+            route,
+            broker_failure_class if route == "broker" and broker_failure_class else "transient",
+            code,
+            "terminal",
+            None,
+            "ytpipe",
+            "none",
+            _display_reason(code),
         )
     delay = max(1, base_delay_seconds) * (2 ** min(attempt_count - 1, 5))
     return SummaryFailureOutcome(
@@ -103,5 +113,6 @@ def _display_reason(code: str) -> str:
         "broker_output_invalid": "El broker devolvió una salida inválida.",
         "broker_input_too_large": "La entrada supera el límite aceptado por el broker.",
         "broker_protocol_error": "El broker devolvió una respuesta incompatible.",
+        "backend_error": "El backend de inferencia no pudo completar la solicitud.",
     }
     return reasons.get(code, "El resumen no pudo generarse por un error controlado.")

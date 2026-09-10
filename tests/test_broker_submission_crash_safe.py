@@ -319,6 +319,35 @@ def test_post_location_transport_quarantines_both_and_blocks_new_post(db_session
     assert stage.failure_code == "broker_transport_error"
 
 
+def test_post_location_protocol_error_preserves_task_for_get_only_resolution(db_session, user, video) -> None:
+    """A malformed accepted envelope is post-Location ambiguity, not a new POST."""
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if request.method == "POST":
+            malformed = {**_task(), "unexpected": "field"}
+            return _response(202, json=malformed, headers={"Location": "/v1/tasks/t-1"})
+        raise AssertionError("protocol failure must not GET an unvalidated task")
+
+    service = _traffic_service(handler)
+    try:
+        pipeline = PipelineService(summarization_service=service)  # type: ignore[arg-type]
+        stage = _seed_stage(db_session, user, video)
+        assert pipeline._attempt_summary_stage(db_session, stage, video) is True
+        db_session.commit()
+    finally:
+        service.close()
+
+    assert methods == ["POST"]
+    assert stage.status == STATUS_PENDING_RETRY
+    assert stage.quarantined_at is not None
+    assert stage.reconciliation_status == "awaiting_operator_resolution"
+    assert stage.broker_task_id == "t-1"
+    assert stage.failure_class == "indeterminate"
+    assert stage.failure_code == "broker_protocol_error"
+
+
 def test_post_location_deadline_quarantines_both_with_broker_timeout(db_session, user, video) -> None:
     """Polling until the deadline without a terminal result quarantines both
     with broker_timeout; no new POST is issued."""
@@ -360,7 +389,7 @@ def test_post_location_deadline_quarantines_both_with_broker_timeout(db_session,
         service.close()
 
     assert outcome.disposition == "quarantine"
-    assert methods == ["POST", "GET", "GET"]
+    assert methods == ["POST", "GET"]
     assert stage.quarantined_at is not None
     assert stage.reconciliation_status == "awaiting_operator_resolution"
     assert stage.broker_task_id == "t-1"
@@ -404,12 +433,70 @@ def test_transient_broker_classes_preserved_with_retry_and_correlation(db_sessio
         assert stage.status == STATUS_PENDING_RETRY
         assert stage.failure_class == failure_class
         assert stage.next_attempt_at is not None
-        assert stage.broker_task_id == "t-1"
-        assert stage.broker_idempotency_key is not None
+        assert stage.broker_task_id is None
+        assert stage.broker_idempotency_key is None
+        assert stage.broker_submission_epoch == 1
         assert stage.quarantined_at is None
         # cleanup for the next parametrized iteration
         db_session.delete(stage)
         db_session.commit()
+
+
+def test_confirmed_safe_terminal_failure_creates_new_epoch_task(db_session, user, video) -> None:
+    """A confirmed safe terminal task failure gets one fresh POST on retry."""
+    methods: list[str] = []
+    post_keys: list[str] = []
+    get_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        methods.append(request.method)
+        if request.method == "POST":
+            post_keys.append(request.headers["Idempotency-Key"])
+            task_id = "t-1" if len(post_keys) == 1 else "t-2"
+            return _response(202, json=_task(task_id), headers={"Location": f"/v1/tasks/{task_id}"})
+        get_count += 1
+        if get_count == 1:
+            return _response(
+                200,
+                json={
+                    "status": "failed",
+                    "error": {
+                        "class": "transient_safe",
+                        "code": "backend_error",
+                        "message": "safe detail",
+                    },
+                },
+            )
+        return _response(200, json=_result())
+
+    service = _traffic_service(handler)
+    try:
+        pipeline = PipelineService(summarization_service=service)  # type: ignore[arg-type]
+        stage = _seed_stage(db_session, user, video)
+        assert pipeline._attempt_summary_stage(db_session, stage, video) is True
+        assert stage.status == STATUS_PENDING_RETRY
+        assert stage.broker_submission_epoch == 1
+        assert stage.broker_task_id is None
+        assert stage.broker_idempotency_key is None
+        assert stage.broker_submission_history is not None
+        assert stage.broker_submission_history[0]["epoch"] == 0
+        assert "task_id" not in stage.broker_submission_history[0]
+        assert "idempotency_key" not in stage.broker_submission_history[0]
+
+        stage.next_attempt_at = None
+        db_session.commit()
+        assert pipeline._attempt_summary_stage(db_session, stage, video) is True
+        db_session.commit()
+    finally:
+        service.close()
+
+    assert methods == ["POST", "GET", "POST", "GET"]
+    assert len(post_keys) == 2
+    assert post_keys[0] != post_keys[1]
+    assert stage.broker_submission_epoch == 1
+    assert stage.status == STATUS_COMPLETED
+    assert video.summary == VALID
 
 
 def test_explicit_operator_transition_then_get_only_reconciliation(db_session, user, video) -> None:

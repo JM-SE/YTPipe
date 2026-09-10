@@ -138,11 +138,22 @@ def _succeeded_result(content: str = VALID, finish_reason: str = "stop") -> dict
     }
 
 
+def _task(task_id: str = "t-1") -> dict:
+    return {
+        "id": task_id,
+        "workload": "batch-summary",
+        "capability": "summarize",
+        "status": "queued",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+    }
+
+
 def _response(status: int, payload: object | None = None) -> httpx.Response:
     return httpx.Response(
         status,
         json=payload,
-        headers={},
+        headers={"Location": "/v1/tasks/t-1"} if status in {200, 201, 202} else {},
         request=httpx.Request("POST", "https://broker.test/v1/tasks"),
     )
 
@@ -317,7 +328,10 @@ def test_pipeline_logs_per_summary_attribution_direct(caplog: pytest.LogCaptureF
 
 def test_pipeline_logs_per_summary_attribution_broker(caplog: pytest.LogCaptureFixture) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return _response(200, _succeeded_result())
+        return (
+            _response(201, _task()) if request.method == "POST"
+            else _response(200, _succeeded_result())
+        )
 
     service = _traffic_service(handler)
     try:
@@ -497,7 +511,10 @@ def test_broker_length_finish_maps_incomplete_end_to_end(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return _response(200, _succeeded_result(finish_reason="length"))
+        return (
+            _response(201, _task()) if request.method == "POST"
+            else _response(200, _succeeded_result(finish_reason="length"))
+        )
 
     service = _traffic_service(handler)
     try:

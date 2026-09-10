@@ -444,9 +444,20 @@ def test_stale_reply_lease_keeps_canonical_failure_message(db_session, monkeypat
     text, not the generic fallback."""
     _user, video = add_owner_and_video(db_session)
     canonical = (
-        "Resumen no disponible. Motivo: El broker no confirmó el resultado dentro del plazo; "
-        "requiere reconciliación. Estado: requiere resolución operativa antes de continuar."
+        "Resumen no disponible.\n"
+        "Motivo: El broker no confirmó el resultado dentro del plazo; requiere reconciliación.\n"
+        "Estado: Quarantined: requiere resolución operativa antes de continuar."
     )
+    stage = PipelineStage(
+        video_id=video.id,
+        user_id=_user.id,
+        stage=STAGE_SUMMARY,
+        status="pending_retry",
+        quarantined_at=datetime.now(UTC),
+        failure_class="indeterminate",
+        failure_code="broker_timeout",
+    )
+    db_session.add(stage)
     request = add_request(
         db_session,
         status="failed",

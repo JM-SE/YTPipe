@@ -13,7 +13,7 @@ from app.models.user import User
 from app.models.video import Video
 from app.models.sync_state import SyncState
 from app.services.broker_errors import BrokerSummarizationError
-from app.services.broker_gateway import BrokerSummarizationGateway
+from app.services.broker_gateway import AcceptedTask, BrokerSummarizationGateway
 from app.services.broker_summary import validate_broker_output
 from app.services.direct_summarization import DirectSummarizationGateway, build_summarization_gateway
 from app.services.pipeline import PipelineService, STAGE_SUMMARY, STATUS_PENDING_RETRY, SUMMARIZATION_PROCESS
@@ -122,7 +122,7 @@ def test_broker_200_uses_result_content_and_exact_generic_envelope() -> None:
     requests = []
     def handler(request: httpx.Request):
         requests.append(request)
-        return response(200, json=task_result())
+        return response(200, json=task_result(), headers={"Location": "/v1/tasks/t-1"})
     svc = gateway(handler)
     try:
         assert svc.summarize("short", context=SummaryGatewayContext(9)) == VALID
@@ -137,6 +137,51 @@ def test_broker_200_uses_result_content_and_exact_generic_envelope() -> None:
     assert body == {"workload": "batch-summary", "capability": "summarize", "messages": body["messages"], "generation": {"max_tokens": 123, "temperature": 0.7}, "response": {"kind": "text"}}
     assert not any(field in body for field in ("provider", "model", "backend", "identity", "task_id", "trace"))
     assert "secret-token" not in req.content.decode()
+
+
+def test_pipeline_submission_is_async_only_and_returns_accepted_task() -> None:
+    requests = []
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        return response(201, json=task(), headers={"Location": "/v1/tasks/t-1"})
+
+    svc = gateway(handler)
+    try:
+        accepted = svc.submit_task(
+            SummaryOperation("traffic", 0, "system", "user", 123),
+            "async-pipeline-key",
+        )
+    finally:
+        svc.close()
+
+    assert isinstance(accepted, AcceptedTask)
+    assert accepted.task_id == "t-1"
+    assert [request.method for request in requests] == ["POST"]
+    assert "prefer" not in requests[0].headers
+
+
+def test_pipeline_submission_rejects_terminal_200_without_consuming_result() -> None:
+    requests = []
+
+    def handler(request: httpx.Request):
+        requests.append(request)
+        return response(200, json=task_result(), headers={"Location": "/v1/tasks/t-1"})
+
+    svc = gateway(handler)
+    try:
+        with pytest.raises(BrokerSummarizationError) as exc:
+            svc.submit_task(
+                SummaryOperation("traffic", 0, "system", "user", 123),
+                "async-pipeline-key",
+            )
+    finally:
+        svc.close()
+
+    assert exc.value.code == "broker_protocol_error"
+    assert exc.value.task_id == "t-1"
+    assert exc.value.idempotency_key == "async-pipeline-key"
+    assert [request.method for request in requests] == ["POST"]
 
 
 @pytest.mark.parametrize("status", [201, 202])
@@ -200,13 +245,15 @@ def test_broker_valid_terminal_errors_are_sanitized(state: str) -> None:
 
 def test_broker_synchronous_terminal_failure_uses_result_envelope() -> None:
     error = {"class": "backend_rejected", "code": "backend_rejected", "message": "safe"}
-    svc = gateway(lambda request: response(200, json={"status": "failed", "error": error}))
+    svc = gateway(lambda request: response(200, json={"status": "failed", "error": error}, headers={"Location": "/v1/tasks/t-1"}))
     try:
         with pytest.raises(BrokerSummarizationError) as exc:
             svc.summarize("short", context=SummaryGatewayContext(1))
         assert exc.value.code == "broker_task_failed"
         assert exc.value.failure_class == "backend_rejected"
         assert exc.value.broker_code == "backend_rejected"
+        assert exc.value.task_id == "t-1"
+        assert exc.value.idempotency_key
         assert str(exc.value) == "Broker summarization failed."
     finally:
         svc.close()
@@ -214,12 +261,13 @@ def test_broker_synchronous_terminal_failure_uses_result_envelope() -> None:
 
 def test_broker_unknown_error_class_is_preserved_for_conservative_policy() -> None:
     error = {"class": "future_backend_state", "code": "future_code", "message": "safe"}
-    svc = gateway(lambda request: response(200, json={"status": "failed", "error": error}))
+    svc = gateway(lambda request: response(200, json={"status": "failed", "error": error}, headers={"Location": "/v1/tasks/t-1"}))
     try:
         with pytest.raises(BrokerSummarizationError) as exc:
             svc.summarize("short", context=SummaryGatewayContext(1))
         assert exc.value.failure_class == "future_backend_state"
         assert exc.value.broker_code == "future_code"
+        assert exc.value.task_id == "t-1"
     finally:
         svc.close()
 
@@ -380,7 +428,7 @@ def test_broker_deadline_includes_post() -> None:
     {"status": "succeeded", "result": {"content": VALID, "finish_reason": "stop", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}, "extra": True},
 ])
 def test_broker_200_terminal_result_is_fail_closed(payload) -> None:
-    svc = gateway(lambda request: response(200, json=payload))
+    svc = gateway(lambda request: response(200, json=payload, headers={"Location": "/v1/tasks/t-1"}))
     try:
         with pytest.raises(BrokerSummarizationError) as exc:
             svc.summarize("x", context=SummaryGatewayContext(1))
