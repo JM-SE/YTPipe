@@ -111,3 +111,17 @@ def test_broker_transient_class_is_preserved_when_stage_budget_exhausts() -> Non
         assert outcome.disposition == "terminal"
         assert outcome.failure_class == failure_class
         assert outcome.failure_code == "backend_error"
+
+
+def test_context_exceeded_is_terminal_with_actionable_reason() -> None:
+    outcome = classify_summary_failure(
+        route="broker",
+        code="backend_context_exceeded",
+        broker_failure_class="backend_rejected",
+        attempt_count=1,
+        max_attempts=3,
+        now=datetime.now(UTC),
+    )
+    assert outcome.disposition == "terminal"
+    assert outcome.failure_class == "backend_rejected"
+    assert outcome.display_reason == "El transcript excede el límite de contexto del modelo."

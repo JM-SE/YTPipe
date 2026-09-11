@@ -1223,10 +1223,9 @@ class PipelineService:
                 display_reason=format_summary_failure_code(summary_stage.failure_code),
             )
             message = (
-                f"{format_summary_failure_notice(outcome, title)}\n"
+                f"{format_summary_failure_notice(outcome, title, attempt_count=summary_stage.attempt_count, max_attempts=summary_stage.max_attempts)}\n"
                 f"Canal: {channel_title}\nURL: {video_url}\n"
-                f"{FALLBACK_REASON_SUMMARY.format(max_attempts=summary_stage.max_attempts)} "
-                f"Causa: {_compact_error(summary_stage.last_error or reason)}"
+                f"Causa: {format_summary_failure_code(summary_stage.failure_code)}"
             )
         else:
             message = FALLBACK_MESSAGE_TEMPLATE.format(
@@ -1426,9 +1425,13 @@ class PipelineService:
                         # Telegram/user-facing output.
                         display_reason=format_summary_failure_code(stage.failure_code),
                     )
-                    return format_summary_failure_notice(outcome)
+                    return format_summary_failure_notice(
+                        outcome,
+                        attempt_count=stage.attempt_count,
+                        max_attempts=stage.max_attempts,
+                    )
                 reason = FALLBACK_REASON_SUMMARY.format(max_attempts=stage.max_attempts)
-                specific = format_summary_failure_code(stage.failure_code) if stage.failure_code else stage.last_error
+                specific = format_summary_failure_code(stage.failure_code)
                 outcome = SummaryFailureOutcome(
                     route="broker" if stage.failure_class in {"client_invalid", "policy_rejected", "backend_rejected", "output_invalid", "indeterminate"} else "direct",
                     failure_class=stage.failure_class or "permanent",
@@ -1439,7 +1442,11 @@ class PipelineService:
                     recovery_action="none",
                     display_reason=specific or reason,
                 )
-                notice = format_summary_failure_notice(outcome)
+                notice = format_summary_failure_notice(
+                    outcome,
+                    attempt_count=stage.attempt_count,
+                    max_attempts=stage.max_attempts,
+                )
                 return notice
             if stage_name == STAGE_TELEGRAM:
                 reason = FALLBACK_REASON_TELEGRAM.format(max_attempts=stage.max_attempts)

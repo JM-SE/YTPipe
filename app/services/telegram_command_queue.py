@@ -582,6 +582,8 @@ class TelegramCommandQueueService:
                 return format_persisted_summary_failure(
                     failure_code=stage.failure_code,
                     quarantined=stage.quarantined_at is not None,
+                    attempt_count=stage.attempt_count,
+                    max_attempts=stage.max_attempts,
                 )
             return "No se pudo completar el resumen de este video."
         return "No se pudo completar la solicitud."

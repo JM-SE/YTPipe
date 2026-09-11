@@ -114,5 +114,6 @@ def _display_reason(code: str) -> str:
         "broker_input_too_large": "La entrada supera el límite aceptado por el broker.",
         "broker_protocol_error": "El broker devolvió una respuesta incompatible.",
         "backend_error": "El backend de inferencia no pudo completar la solicitud.",
+        "backend_context_exceeded": "El transcript excede el límite de contexto del modelo.",
     }
     return reasons.get(code, "El resumen no pudo generarse por un error controlado.")

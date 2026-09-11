@@ -778,8 +778,8 @@ class TestFallbackTelegram:
 
         assert stats.fallbacks_sent == 1
         call = telegram_service.send_message.call_args
-        assert FALLBACK_REASON_SUMMARY.format(max_attempts=3) in call[0][0]
-        assert "Causa: Summary generation failed." in call[0][0]
+        assert "Intentos realizados: 3 de 3." in call[0][0]
+        assert "Causa: El resumen no pudo generarse por un error controlado." in call[0][0]
 
     def test_fallback_reason_telegram(self, db_session, user, channel, video,
                                         transcript_service, telegram_service):
@@ -808,6 +808,25 @@ class TestFallbackTelegram:
         assert stats.fallbacks_sent == 1
         call = telegram_service.send_message.call_args
         assert FALLBACK_REASON_TELEGRAM.format(max_attempts=3) in call[0][0]
+
+    def test_fallback_reason_summary_does_not_use_free_form_error(self, db_session, user, channel, video,
+                                                                   transcript_service, telegram_service):
+        svc = make_pipeline_service(
+            transcript_svc=transcript_service,
+            summarization_svc=MagicMock(),
+            telegram_svc=telegram_service,
+        )
+        stages = svc.create_stages_for_video(db_session, user.id, video.id)
+        summary_stage = next(stage for stage in stages if stage.stage == STAGE_SUMMARY)
+        summary_stage.status = STATUS_FAILED
+        summary_stage.failure_code = None
+        summary_stage.last_error = "provider body with prompt and task-id-secret"
+
+        message = svc._build_fallback_reason({stage.stage: stage for stage in stages})
+
+        assert message is not None
+        assert "El resumen no pudo generarse por un error controlado." in message
+        assert "provider body with prompt and task-id-secret" not in message
 
 
 class TestProcessPendingStages:
