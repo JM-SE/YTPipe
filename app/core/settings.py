@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     llama_cpp_max_tokens: int = Field(default=1024, alias="LLAMA_CPP_MAX_TOKENS")
     llama_cpp_auto_restart_enabled: bool = Field(default=False, alias="LLAMA_CPP_AUTO_RESTART_ENABLED")
     llama_cpp_restart_cooldown_seconds: int = Field(default=300, ge=0, alias="LLAMA_CPP_RESTART_COOLDOWN_SECONDS")
+    llama_cpp_broker_backend_error_threshold: int = Field(default=2, ge=1, alias="LLAMA_CPP_BROKER_BACKEND_ERROR_THRESHOLD")
+    llama_cpp_broker_backend_error_window_seconds: int = Field(default=10800, ge=60, alias="LLAMA_CPP_BROKER_BACKEND_ERROR_WINDOW_SECONDS")
     telegram_notifications_enabled: bool = Field(default=False, alias="TELEGRAM_NOTIFICATIONS_ENABLED")
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.services.youtube_video_metadata import (
@@ -16,7 +16,7 @@ QUOTA_ALERT_THRESHOLDS = (50, 75, 90)
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.channel import Channel
@@ -44,6 +44,8 @@ from app.services.transcript import TranscriptService
 
 POLLING_PROCESS = "polling"
 QUOTA_PROCESS = "quota"
+BROKER_BACKEND_ERROR_CODE = "backend_error"
+BROKER_BACKEND_INCIDENT_KEY = "broker_backend_incident"
 RECONCILIATION_PROCESS = "reconciliation"
 UNUSABLE_UPLOADS_PLAYLIST_ERROR = "unusable_uploads_playlist"
 DEFAULT_DELIVERY_STATUS = "pending"
@@ -104,6 +106,8 @@ class YouTubePollingService:
         pipeline_service: PipelineService | None = None,
         pipeline_drain_pause_seconds: float = 60.0,
         llama_recovery_service: LlamaRecoveryService | None = None,
+        broker_backend_error_threshold: int = 2,
+        broker_backend_error_window_seconds: int = 10800,
     ):
         self.auth_service = auth_service
         self.email_service = email_service
@@ -117,6 +121,8 @@ class YouTubePollingService:
         self.pipeline_service = pipeline_service
         self.pipeline_drain_pause_seconds = max(0.0, pipeline_drain_pause_seconds)
         self.llama_recovery_service = llama_recovery_service
+        self.broker_backend_error_threshold = max(1, broker_backend_error_threshold)
+        self.broker_backend_error_window_seconds = max(60, broker_backend_error_window_seconds)
 
     def run_poll(self, session: Session, user: User, oauth_account: OAuthAccount) -> PollRunSummary:
         now = datetime.now(UTC)
@@ -480,9 +486,7 @@ class YouTubePollingService:
             self._finalize_direct_incident(session, user, summarization_state, metadata, now)
         else:
             metadata.pop("direct_incident", None)
-            summarization_state.last_success_at = now
-            summarization_state.last_error_at = None
-            summarization_state.last_error_message = None
+            self._finalize_broker_backend_incident(session, user, summarization_state, metadata, now)
 
         summarization_state.state_metadata = metadata
         session.flush()
@@ -537,6 +541,117 @@ class YouTubePollingService:
         metadata["direct_incident"] = incident
         state.last_error_at = now
         state.last_error_message = stage.last_error
+
+    def _finalize_broker_backend_incident(
+        self,
+        session: Session,
+        user: User,
+        state: SyncState,
+        metadata: dict[str, Any],
+        now: datetime,
+    ) -> None:
+        """Watchdog for a degraded-but-alive backend on the broker route.
+
+        The broker classifies llama 5xx/429 as ``transient_safe/backend_error``
+        with ``max_attempts=1``, so repeated ``backend_error`` stages mean the
+        backend keeps failing while its process stays alive: systemd
+        ``Restart=on-failure`` never fires and the direct-only incident path
+        never runs. After ``threshold`` broker ``backend_error`` summary
+        stages inside ``window`` with no newer success, request one bounded
+        llama restart per cooldown and alert once. Terminal stages are never
+        reopened and other failure codes never count.
+        """
+        threshold = max(1, self.broker_backend_error_threshold)
+        window_seconds = max(60, self.broker_backend_error_window_seconds)
+        cutoff = now - timedelta(seconds=window_seconds)
+
+        latest_success_at = session.scalar(
+            select(func.max(PipelineStage.updated_at)).where(
+                PipelineStage.user_id == user.id,
+                PipelineStage.stage == "summary",
+                PipelineStage.status == "completed",
+                PipelineStage.updated_at >= cutoff,
+            )
+        )
+        error_filter = [
+            PipelineStage.user_id == user.id,
+            PipelineStage.stage == "summary",
+            PipelineStage.failure_code == BROKER_BACKEND_ERROR_CODE,
+            PipelineStage.status.in_(["pending_retry", "failed"]),
+            PipelineStage.updated_at >= cutoff,
+        ]
+        if latest_success_at is not None:
+            # Only failures after the latest success count: any newer success
+            # proves the backend recovered and clears the incident below.
+            error_filter.append(PipelineStage.updated_at > latest_success_at)
+        recent_errors = list(
+            session.scalars(
+                select(PipelineStage)
+                .where(*error_filter)
+                .order_by(PipelineStage.updated_at.desc())
+                .limit(threshold)
+            ).all()
+        )
+        if not recent_errors:
+            metadata.pop(BROKER_BACKEND_INCIDENT_KEY, None)
+            state.last_success_at = now
+            state.last_error_at = None
+            state.last_error_message = None
+            return
+
+        failure_count = len(recent_errors)
+        incident = dict(metadata.get(BROKER_BACKEND_INCIDENT_KEY) or {})
+        incident.setdefault("started_at", now.isoformat())
+        incident["failure_code"] = BROKER_BACKEND_ERROR_CODE
+        incident["failure_count"] = failure_count
+        latest_failure_at = recent_errors[0].updated_at
+        incident["last_failure_at"] = (
+            latest_failure_at.isoformat() if latest_failure_at is not None else now.isoformat()
+        )
+        if failure_count < threshold:
+            # Below threshold: keep the pending incident for the next poll,
+            # but neither restart nor alert yet.
+            metadata[BROKER_BACKEND_INCIDENT_KEY] = incident
+            state.last_error_at = now
+            state.last_error_message = (
+                "El backend de inferencia falló "
+                f"{failure_count} veces. Se espera el umbral configurado."
+            )
+            return
+        restart_message = "Reinicio automático de llama.cpp no configurado."
+        if self._restart_allowed(incident, now):
+            result = self.llama_recovery_service.restart() if self.llama_recovery_service else None
+            if result is not None:
+                incident["restart_attempted_at"] = now.isoformat()
+                incident["restart_succeeded"] = result.succeeded
+                restart_message = result.reason
+        elif incident.get("restart_attempted_at"):
+            restart_message = "El reinicio de llama.cpp espera el cooldown configurado."
+        if not incident.get("alert_sent"):
+            if self._send_broker_backend_alert(user, failure_count, restart_message):
+                incident["alert_sent"] = True
+        metadata[BROKER_BACKEND_INCIDENT_KEY] = incident
+        state.last_error_at = now
+        state.last_error_message = (
+            "El backend de inferencia falló "
+            f"{failure_count} veces. {restart_message}"
+        )
+
+    def _send_broker_backend_alert(self, user: User, failure_count: int, restart_message: str) -> bool:  # noqa: ARG002
+        if self.telegram_service is None or not self.telegram_service.enabled:
+            return True
+        try:
+            self.telegram_service.send_message(
+                "⚠️ YTPipe: el backend de inferencia falló "
+                f"{failure_count} veces seguidas\n\n"
+                "Causa: El backend de inferencia no pudo completar la solicitud.\n"
+                f"Recuperación: {restart_message}\n"
+                "Los videos afectados quedan en retry controlado o terminal según su presupuesto."
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not send broker backend Telegram alert.")
+            return False
+        return True
 
     def _send_direct_summary_alert(self, user: User, reason: str, restart_message: str) -> bool:
         if self.telegram_service is None or not self.telegram_service.enabled:

@@ -349,6 +349,8 @@ def _build_polling_service(settings: Settings) -> YouTubePollingService:
             enabled=settings.llama_cpp_auto_restart_enabled,
             cooldown_seconds=settings.llama_cpp_restart_cooldown_seconds,
         ),
+        broker_backend_error_threshold=settings.llama_cpp_broker_backend_error_threshold,
+        broker_backend_error_window_seconds=settings.llama_cpp_broker_backend_error_window_seconds,
     )
 
 
