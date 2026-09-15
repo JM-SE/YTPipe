@@ -343,6 +343,13 @@ def _build_polling_service(settings: Settings) -> YouTubePollingService:
             startup_batch_size=settings.pipeline_startup_batch_size,
             startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
             shorts_processing_enabled=settings.shorts_processing_enabled,
+            broker_chunking_enabled=settings.broker_chunking_enabled,
+            broker_llm_context_tokens=settings.broker_llm_context_tokens,
+            broker_chunk_chars=settings.broker_chunk_chars,
+            broker_chunk_overlap_chars=settings.broker_chunk_overlap_chars,
+            broker_max_chunks=settings.broker_max_chunks,
+            broker_chars_per_token_estimate=settings.broker_chars_per_token_estimate,
+            broker_max_tokens=getattr(pipeline_gateway, "max_tokens", settings.llama_cpp_max_tokens),
         ),
         pipeline_drain_pause_seconds=settings.pipeline_drain_pause_seconds,
         llama_recovery_service=LlamaRecoveryService(

@@ -79,13 +79,15 @@ class BrokerTaskClient:
     def submit_result(self, operation: BrokerOperation, idempotency_key_value: str) -> BrokerResult:
         return self._gateway._submit_result_with_key(operation, idempotency_key_value)
 
-    def submit_task(self, operation: BrokerOperation, idempotency_key_value: str) -> AcceptedTask:
+    def submit_task(
+        self, operation: BrokerOperation, idempotency_key_value: str, *, timeout: float | None = None
+    ) -> AcceptedTask:
         """POST only for persistence-owned pipeline submissions.
 
         The pipeline deliberately uses the non-blocking broker response so the
         accepted task correlation can be committed before any result GET.
         """
-        return self._gateway.submit_task(operation, idempotency_key_value)
+        return self._gateway.submit_task(operation, idempotency_key_value, timeout=timeout)
 
     def poll_result(
         self,
@@ -177,14 +179,14 @@ class BrokerSummarizationGateway:
             return polled
         raise broker_error("broker_timeout", task_id=task_id, idempotency_key=key)
 
-    def submit_task(self, operation: SummaryOperation, key: str) -> AcceptedTask:
+    def submit_task(self, operation: SummaryOperation, key: str, *, timeout: float | None = None) -> AcceptedTask:
         """POST only for the persistence-owned asynchronous protocol.
 
         No ``Prefer`` header is sent: the broker returns ``201`` with a
         validated task envelope and ``Location``. The persistence owner stores
         that correlation before issuing a result GET.
         """
-        accepted = self._submit_task_response(operation, key, prefer=False)
+        accepted = self._submit_task_response(operation, key, prefer=False, timeout=timeout)
         if not isinstance(accepted, AcceptedTask):
             raise broker_error("broker_protocol_error", idempotency_key=key)
         return accepted
@@ -195,6 +197,7 @@ class BrokerSummarizationGateway:
         key: str,
         *,
         prefer: bool,
+        timeout: float | None = None,
     ) -> BrokerResult | AcceptedTask:
         """Parse one POST response for either blocking or durable callers.
 
@@ -218,7 +221,7 @@ class BrokerSummarizationGateway:
             "generation": generation,
             "response": {"kind": profile.response_kind if profile is not None else "text"},
         }
-        deadline = self._clock() + self._timeout
+        deadline = self._clock() + (timeout if timeout is not None else self._timeout)
         remaining = deadline - self._clock()
         if remaining <= 0:
             raise broker_error("broker_timeout", idempotency_key=key)

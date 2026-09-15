@@ -35,3 +35,16 @@ def validate_broker_output(value: object) -> str:
     if any(line.strip() and not line.startswith("•") for line in points):
         raise ValueError(BROKER_VALIDATION_ERROR)
     return "\n".join(lines)
+
+
+def validate_broker_partial_output(value: object) -> str:
+    """Validate the deliberately smaller bullet-only map output."""
+    if not isinstance(value, str):
+        raise ValueError(BROKER_VALIDATION_ERROR)
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = [line.rstrip(" \t") for line in normalized.split("\n") if line.strip()]
+    if not 5 <= len(lines) <= 8 or any(not line.startswith("•") or not line[1:].strip() for line in lines):
+        raise ValueError(BROKER_VALIDATION_ERROR)
+    if any(tag in normalized.casefold() for tag in ("<think", "</think>")):
+        raise ValueError(BROKER_VALIDATION_ERROR)
+    return "\n".join(lines)

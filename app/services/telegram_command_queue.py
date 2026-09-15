@@ -495,12 +495,20 @@ class TelegramCommandQueueService:
         # Legacy process-wide pause metadata is retained for audit only. It is
         # not authoritative after Y02c and must not block a manual command.
         summary_paused = False
+        summarization_gateway = build_routed_summarization_gateway(self.settings, root="telegram")
         pipeline = PipelineService(
             transcript_service=TranscriptService(self.settings),
-            summarization_service=build_routed_summarization_gateway(self.settings, root="telegram"),
+            summarization_service=summarization_gateway,
             startup_batch_size=0,
             summary_paused=summary_paused,
             shorts_processing_enabled=self.settings.shorts_processing_enabled,
+            broker_chunking_enabled=self.settings.broker_chunking_enabled,
+            broker_llm_context_tokens=self.settings.broker_llm_context_tokens,
+            broker_chunk_chars=self.settings.broker_chunk_chars,
+            broker_chunk_overlap_chars=self.settings.broker_chunk_overlap_chars,
+            broker_max_chunks=self.settings.broker_max_chunks,
+            broker_chars_per_token_estimate=self.settings.broker_chars_per_token_estimate,
+            broker_max_tokens=getattr(summarization_gateway, "max_tokens", self.settings.llama_cpp_max_tokens),
         )
         failure = (summary_state.state_metadata or {}).get("summary_failure") if summary_state else None
         target = failure.get("recovery_target") if isinstance(failure, dict) else "none"

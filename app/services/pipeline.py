@@ -17,11 +17,24 @@ from app.models.user import User
 from app.models.video import Video
 from app.services.telegram import TelegramDeliveryAttemptError, TelegramDeliveryService, TelegramNotificationPayload
 from app.services.transcript import TranscriptService
-from app.services.broker_submission import BrokerSubmissionCoordinator
-from app.services.summarization_gateway import SummarizationGateway, SummaryGatewayContext
+from app.services.broker_chunking import (
+    BrokerChunkConfig,
+    BrokerChunkPlanError,
+    build_plan,
+    config_from_plan,
+    estimated_request_tokens,
+    validate_plan,
+)
+from app.services.broker_submission import (
+    RECONCILIATION_ACCEPTED,
+    RECONCILIATION_PREPARED,
+    BrokerSubmissionCoordinator,
+)
+from app.services.summarization_gateway import SummarizationGateway, SummaryGatewayContext, SummaryOperation
 from app.services.summary_route import summarization_route_name
 from app.services.summary_failure_policy import SummaryFailureOutcome, classify_summary_failure
 from app.services.telegram_failure_notice import format_summary_failure_code, format_summary_failure_notice
+from app.services.summarization import FINAL_SUMMARY_INSTRUCTIONS, PARTIAL_SUMMARY_INSTRUCTIONS
 
 logger = logging.getLogger(__name__)
 _SUMMARY_INFERENCE_LOCK = threading.Lock()
@@ -95,6 +108,14 @@ class PipelineService:
         startup_batch_delay_seconds: float = 30.0,
         summary_paused: bool = False,
         shorts_processing_enabled: bool = True,
+        broker_chunking_enabled: bool = False,
+        broker_llm_context_tokens: int = 16_384,
+        broker_chunk_chars: int = 24_000,
+        broker_chunk_overlap_chars: int = 2_000,
+        broker_max_chunks: int = 6,
+        broker_chars_per_token_estimate: float = 4.0,
+        broker_max_tokens: int = 1_024,
+        broker_plan_deadline_seconds: float = 360.0,
     ):
         self.transcript_service = transcript_service
         self.summarization_service = summarization_service
@@ -103,6 +124,16 @@ class PipelineService:
         self.startup_batch_delay_seconds = max(0, startup_batch_delay_seconds)
         self.summary_paused = summary_paused
         self.shorts_processing_enabled = shorts_processing_enabled
+        self.broker_chunk_config = BrokerChunkConfig(
+            enabled=broker_chunking_enabled,
+            context_tokens=broker_llm_context_tokens,
+            chunk_chars=broker_chunk_chars,
+            overlap_chars=broker_chunk_overlap_chars,
+            max_chunks=broker_max_chunks,
+            chars_per_token=broker_chars_per_token_estimate,
+            max_tokens=broker_max_tokens,
+        )
+        self.broker_plan_deadline_seconds = min(360.0, max(1.0, broker_plan_deadline_seconds))
         self.summary_pause_reason: str | None = None
         self.summary_pause_video_id: int | None = None
         self.summary_recovery_succeeded = False
@@ -329,10 +360,30 @@ class PipelineService:
         ).all()
         completed = 0
         for stage, video in rows:
+            plan = getattr(stage, "broker_chunk_plan", None)
+            step = None
+            if plan is not None:
+                try:
+                    plan = validate_plan(plan, video.transcript or "")
+                    step = plan["steps"][plan["next_step"]]
+                except (BrokerChunkPlanError, IndexError, TypeError, KeyError):
+                    stage.status = STATUS_FAILED
+                    stage.failure_class = "internal"
+                    stage.failure_code = "broker_chunk_plan_invalid"
+                    stage.last_error = format_summary_failure_code(stage.failure_code)
+                    stage.broker_chunk_plan = None
+                    stage.quarantined_at = None
+                    stage.reconciliation_status = None
+                    continue
+            reconcile_kwargs = {"idempotency_key": stage.broker_idempotency_key}
+            if step is not None:
+                reconcile_kwargs["operation_kind"] = (
+                    "traffic_partial" if step.get("kind") == "partial" else "traffic_final"
+                )
             try:
                 summary = reconcile(
                     stage.broker_task_id,
-                    idempotency_key=stage.broker_idempotency_key,
+                    **reconcile_kwargs,
                 )
             except Exception as exc:
                 stage.last_error = format_summary_failure_code(getattr(exc, "broker_code", None) or getattr(exc, "code", None))
@@ -345,10 +396,39 @@ class PipelineService:
                     stage.status = STATUS_FAILED
                     stage.quarantined_at = None
                     stage.reconciliation_status = None
+                    stage.broker_chunk_plan = None
                 continue
             if summary is None:
                 stage.next_reconcile_at = datetime.now(UTC) + timedelta(seconds=60)
                 continue
+            if plan is not None:
+                if step.get("kind") == "partial":
+                    step["status"] = "completed"
+                    step["output"] = summary
+                    plan["next_step"] = plan["next_step"] + 1
+                    stage.broker_chunk_plan = plan
+                    stage.status = STATUS_PENDING_RETRY
+                    stage.last_error = None
+                    stage.failure_class = None
+                    stage.failure_code = None
+                    stage.attempt_count = max(0, stage.attempt_count - 1)
+                    stage.broker_task_id = None
+                    stage.broker_idempotency_key = None
+                    stage.quarantined_at = None
+                    stage.reconciliation_status = None
+                    stage.next_reconcile_at = None
+                    stage.next_attempt_at = None
+                    continue
+                if step.get("kind") != "final":
+                    stage.status = STATUS_FAILED
+                    stage.failure_class = "internal"
+                    stage.failure_code = "broker_chunk_plan_invalid"
+                    stage.last_error = format_summary_failure_code(stage.failure_code)
+                    stage.broker_chunk_plan = None
+                    stage.quarantined_at = None
+                    stage.reconciliation_status = None
+                    continue
+                stage.attempt_count = max(0, stage.attempt_count - 1)
             video.summary = summary
             stage.status = STATUS_COMPLETED
             stage.last_error = None
@@ -357,6 +437,7 @@ class PipelineService:
             stage.quarantined_at = None
             stage.reconciliation_status = None
             stage.next_reconcile_at = None
+            stage.broker_chunk_plan = None
             completed += 1
         session.flush()
         return completed
@@ -802,14 +883,15 @@ class PipelineService:
             return True
 
         attempted_at = datetime.now(UTC)
-        stage.attempt_count += 1
-        stage.last_attempt_at = attempted_at
 
         route = summarization_route_name(self.summarization_service)
         if route == "broker":
             return self._attempt_broker_summary_stage(
                 session, stage, video, attempted_at
             )
+
+        stage.attempt_count += 1
+        stage.last_attempt_at = attempted_at
 
         try:
             # Per-summarization route attribution for Y02 one-to-one
@@ -944,29 +1026,181 @@ class PipelineService:
             stage_id=stage.id,
             broker_submission_epoch=getattr(stage, "broker_submission_epoch", 0),
         )
-        coordinator = BrokerSubmissionCoordinator(
-            self.summarization_service,
-            timeout_seconds=getattr(self.summarization_service, "timeout_seconds", None),
-        )
-        with _SUMMARY_INFERENCE_LOCK:
-            outcome = coordinator.attempt(
-                session,
-                stage,
-                video,
-                context=context,
-                attempted_at=attempted_at,
+        if getattr(stage, "reconciliation_status", None) in {
+            RECONCILIATION_PREPARED,
+            RECONCILIATION_ACCEPTED,
+        }:
+            stage.attempt_count += 1
+            stage.last_attempt_at = attempted_at
+            coordinator = BrokerSubmissionCoordinator(
+                self.summarization_service,
+                timeout_seconds=getattr(self.summarization_service, "timeout_seconds", None),
             )
-        self._summary_recovery_target = "none"
-        if outcome.disposition == "completed":
-            self._clear_summary_failure_state(session, user_id=stage.user_id)
+            with _SUMMARY_INFERENCE_LOCK:
+                outcome = coordinator.attempt(
+                    session, stage, video, context=context, attempted_at=attempted_at
+                )
+            self._summary_recovery_target = "none"
+            logger.info(
+                "summary_failed code=%s route=broker stage_id=%s video_id=%s",
+                outcome.failure_code,
+                stage.id,
+                video.id,
+            )
             return True
-        logger.info(
-            "summary_failed code=%s route=broker stage_id=%s video_id=%s",
-            outcome.failure_code,
-            stage.id,
-            video.id,
+        config = self.broker_chunk_config
+        plan = getattr(stage, "broker_chunk_plan", None)
+        try:
+            if plan is None:
+                plan = build_plan(video.transcript, config)
+                if plan is not None:
+                    stage.broker_chunk_plan = plan
+                    session.flush()
+                    session.commit()
+            else:
+                validate_plan(plan, video.transcript)
+        except BrokerChunkPlanError:
+            code = "backend_context_exceeded" if plan is None else "broker_chunk_plan_invalid"
+            self._record_local_broker_failure(session, stage, attempted_at, code)
+            return True
+
+        active_config = config if plan is None else config_from_plan(plan)
+
+        if plan is None:
+            stage.attempt_count += 1
+            stage.last_attempt_at = attempted_at
+            coordinator = BrokerSubmissionCoordinator(
+                self.summarization_service,
+                timeout_seconds=getattr(self.summarization_service, "timeout_seconds", None),
+            )
+            with _SUMMARY_INFERENCE_LOCK:
+                outcome = coordinator.attempt(
+                    session, stage, video, context=context, attempted_at=attempted_at
+                )
+            self._summary_recovery_target = "none"
+            if outcome.disposition == "completed":
+                self._clear_summary_failure_state(session, user_id=stage.user_id)
+            logger.info(
+                "summary_failed code=%s route=broker stage_id=%s video_id=%s",
+                outcome.failure_code,
+                stage.id,
+                video.id,
+            ) if outcome.disposition != "completed" else None
+            return True
+
+        deadline = time.monotonic() + self.broker_plan_deadline_seconds
+        while True:
+            plan = validate_plan(getattr(stage, "broker_chunk_plan", None), video.transcript)
+            next_step = plan["next_step"]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.5:
+                session.commit()
+                return True
+
+            step = plan["steps"][next_step]
+            kind = step.get("kind")
+            ordinal = step.get("ordinal")
+            if kind == "partial":
+                start, end = step.get("start"), step.get("end")
+                if not isinstance(start, int) or not isinstance(end, int) or not 0 <= start < end <= len(video.transcript):
+                    self._record_local_broker_failure(session, stage, attempted_at, "broker_chunk_plan_invalid")
+                    return True
+                user_prompt = PARTIAL_SUMMARY_INSTRUCTIONS + "\n\nFRAGMENTO:\n\n" + video.transcript[start:end]
+                operation_kind = "traffic_partial"
+            elif kind == "final":
+                outputs = [s.get("output") for s in plan["steps"][:-1]]
+                if not all(isinstance(output, str) and output for output in outputs):
+                    self._record_local_broker_failure(session, stage, attempted_at, "broker_chunk_plan_invalid")
+                    return True
+                user_prompt = (
+                    "Integra los siguientes resumenes parciales en un unico resumen completo, sin repetir ideas y "
+                    "conservando los hechos importantes.\n\n"
+                    + FINAL_SUMMARY_INSTRUCTIONS
+                    + "\n\nRESUMENES PARCIALES:\n\n"
+                    + "\n\n---\n\n".join(outputs)
+                )
+                if estimated_request_tokens(len(user_prompt), active_config) > active_config.context_tokens:
+                    self._record_local_broker_failure(session, stage, attempted_at, "backend_context_exceeded")
+                    return True
+                operation_kind = "traffic_final"
+            else:
+                self._record_local_broker_failure(session, stage, attempted_at, "broker_chunk_plan_invalid")
+                return True
+
+            operation_factory = getattr(self.summarization_service, "operation_for", None)
+            if not callable(operation_factory):
+                self._record_local_broker_failure(session, stage, attempted_at, "broker_protocol_error")
+                return True
+            operation = operation_factory(kind=operation_kind, ordinal=ordinal, user_prompt=user_prompt)
+            stage.attempt_count += 1
+            stage.last_attempt_at = attempted_at
+            coordinator = BrokerSubmissionCoordinator(
+                self.summarization_service,
+                timeout_seconds=remaining,
+            )
+
+            def save_completed(output: str, *, plan=plan, next_step=next_step, stage=stage) -> None:
+                # A successful chunk is progress, not a consumed stage retry.
+                stage.attempt_count = max(0, stage.attempt_count - 1)
+                plan["steps"][next_step]["status"] = "completed"
+                plan["steps"][next_step]["output"] = output
+                plan["next_step"] = next_step + 1
+                if plan["next_step"] >= len(plan["steps"]):
+                    stage.broker_chunk_plan = None
+                else:
+                    # SQLAlchemy JSON columns do not track nested mutations;
+                    # reassign the root so the coordinator's commit persists
+                    # progress atomically with clearing the active task.
+                    stage.broker_chunk_plan = plan
+
+            with _SUMMARY_INFERENCE_LOCK:
+                outcome = coordinator.attempt(
+                    session,
+                    stage,
+                    video,
+                    context=context,
+                    attempted_at=attempted_at,
+                    operation=operation,
+                    finalize_stage=kind == "final",
+                    on_completed=save_completed,
+                    deadline=deadline,
+                )
+            self._summary_recovery_target = "none"
+            if outcome.disposition != "completed":
+                logger.info(
+                    "summary_failed code=%s route=broker stage_id=%s video_id=%s",
+                    outcome.failure_code,
+                    stage.id,
+                    video.id,
+                )
+                return True
+            if kind == "final":
+                self._clear_summary_failure_state(session, user_id=stage.user_id)
+                return True
+
+    def _record_local_broker_failure(
+        self, session: Session, stage: PipelineStage, attempted_at: datetime, code: str
+    ) -> None:
+        stage.attempt_count += 1
+        stage.last_attempt_at = attempted_at
+        outcome = classify_summary_failure(
+            route="broker",
+            code=code,
+            attempt_count=stage.attempt_count,
+            max_attempts=stage.max_attempts,
+            now=attempted_at,
+            broker_failure_class="backend_rejected" if code == "backend_context_exceeded" else "internal",
         )
-        return True
+        stage.failure_class = outcome.failure_class
+        stage.failure_code = outcome.failure_code
+        stage.last_error = outcome.display_reason
+        stage.next_attempt_at = outcome.retry_at
+        stage.status = STATUS_FAILED if outcome.disposition == "terminal" else STATUS_PENDING_RETRY
+        stage.broker_chunk_plan = None
+        stage.broker_task_id = None
+        stage.broker_idempotency_key = None
+        session.flush()
+        session.commit()
 
     def attempt_summary_recovery(self, session: Session, user: User) -> bool | None:
         """Attempt at most one real pending summary while the circuit is open."""

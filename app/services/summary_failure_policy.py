@@ -37,6 +37,7 @@ _BROKER_TERMINAL_CODES = {
     "broker_invalid_request",
     "broker_input_too_large",
     "broker_protocol_error",
+    "broker_chunk_plan_invalid",
     "broker_location_invalid",
     "broker_unauthorized",
 }
@@ -113,6 +114,7 @@ def _display_reason(code: str) -> str:
         "broker_output_invalid": "El broker devolvió una salida inválida.",
         "broker_input_too_large": "La entrada supera el límite aceptado por el broker.",
         "broker_protocol_error": "El broker devolvió una respuesta incompatible.",
+        "broker_chunk_plan_invalid": "El plan de resumen del broker no es válido y requiere revisión operativa.",
         "backend_error": "El backend de inferencia no pudo completar la solicitud.",
         "backend_context_exceeded": "El transcript excede el límite de contexto del modelo.",
     }

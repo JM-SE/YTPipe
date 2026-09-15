@@ -182,6 +182,13 @@ def _process_pending_pipeline_startup(settings: Settings) -> None:
                     startup_batch_delay_seconds=settings.pipeline_startup_batch_delay_seconds,
                     summary_paused=summary_paused,
                     shorts_processing_enabled=settings.shorts_processing_enabled,
+                    broker_chunking_enabled=settings.broker_chunking_enabled,
+                    broker_llm_context_tokens=settings.broker_llm_context_tokens,
+                    broker_chunk_chars=settings.broker_chunk_chars,
+                    broker_chunk_overlap_chars=settings.broker_chunk_overlap_chars,
+                    broker_max_chunks=settings.broker_max_chunks,
+                    broker_chars_per_token_estimate=settings.broker_chars_per_token_estimate,
+                    broker_max_tokens=getattr(summarization_gateway, "max_tokens", settings.llama_cpp_max_tokens),
                 )
 
                 stats = pipeline_service.process_next_pending_video(session=session, user=user)

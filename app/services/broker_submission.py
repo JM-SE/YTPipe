@@ -14,7 +14,7 @@ from app.models.video import Video
 from app.services.broker_errors import BrokerSummarizationError
 from app.services.broker_gateway import AcceptedTask
 from app.services.broker_safe_retry import can_advance_submission_epoch
-from app.services.summarization_gateway import SummaryGatewayContext
+from app.services.summarization_gateway import SummaryGatewayContext, SummaryOperation
 from app.services.summary_failure_policy import SummaryFailureOutcome, classify_summary_failure
 
 logger = logging.getLogger(__name__)
@@ -83,6 +83,10 @@ class BrokerSubmissionCoordinator:
         *,
         context: SummaryGatewayContext,
         attempted_at: datetime,
+        operation: SummaryOperation | None = None,
+        finalize_stage: bool = True,
+        on_completed: Callable[[str], None] | None = None,
+        deadline: float | None = None,
     ) -> BrokerSubmissionOutcome:
         status = getattr(stage, "reconciliation_status", None)
         if status == RECONCILIATION_PREPARED:
@@ -108,14 +112,31 @@ class BrokerSubmissionCoordinator:
         key_builder = getattr(self._gateway, "idempotency_key_for", None)
         if not callable(key_builder):
             raise BrokerSummarizationError("broker_context_missing")
-        key = key_builder(video.transcript, context)
+        if operation is None:
+            key = key_builder(video.transcript, context)
+        else:
+            operation_key_builder = getattr(self._gateway, "idempotency_key_for_operation", None)
+            if not callable(operation_key_builder):
+                raise BrokerSummarizationError("broker_protocol_error")
+            key = operation_key_builder(operation, context)
         stage.broker_idempotency_key = key[:128]
         stage.reconciliation_status = RECONCILIATION_PREPARED
         session.flush()
         session.commit()
 
         try:
-            accepted = self._gateway.submit_task(video.transcript, context=context)
+            submit_kwargs = {"context": context}
+            if operation is not None:
+                submit_kwargs["operation"] = operation
+            if deadline is not None:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise BrokerSummarizationError("broker_timeout", failure_class="indeterminate")
+                submit_kwargs["timeout"] = remaining
+            if operation is None:
+                accepted = self._gateway.submit_task(video.transcript, **submit_kwargs)
+            else:
+                accepted = self._gateway.submit_task(video.transcript, **submit_kwargs)
         except Exception as exc:
             return self._classify(session, stage, exc, attempted_at, key=key)
         if not isinstance(accepted, AcceptedTask):
@@ -134,7 +155,7 @@ class BrokerSubmissionCoordinator:
         session.flush()
         session.commit()
 
-        deadline = self._clock() + self._timeout_seconds
+        deadline = deadline if deadline is not None else self._clock() + self._timeout_seconds
         while True:
             remaining = deadline - self._clock()
             if remaining <= 0:
@@ -160,11 +181,13 @@ class BrokerSubmissionCoordinator:
                     task_id=task_id,
                 )
             try:
-                result = self._gateway.poll_task(
-                    task_id,
-                    idempotency_key_value=accepted.idempotency_key or key,
-                    timeout=remaining,
-                )
+                poll_kwargs = {
+                    "idempotency_key_value": accepted.idempotency_key or key,
+                    "timeout": remaining,
+                }
+                if operation is not None:
+                    poll_kwargs["operation_kind"] = operation.kind
+                result = self._gateway.poll_task(task_id, **poll_kwargs)
             except Exception as exc:
                 return self._classify(
                     session,
@@ -176,7 +199,14 @@ class BrokerSubmissionCoordinator:
                 )
             if result is None:
                 continue
-            return self._complete(session, stage, video, result)
+            return self._complete(
+                session,
+                stage,
+                video,
+                result,
+                finalize_stage=finalize_stage,
+                on_completed=on_completed,
+            )
 
     def _classify(
         self,
@@ -329,6 +359,7 @@ class BrokerSubmissionCoordinator:
         elif outcome.disposition == "terminal":
             stage.status = STATUS_FAILED
             stage.reconciliation_status = None
+            stage.broker_chunk_plan = None
         else:
             # transient retry: keep the stage per-video retryable and due, with
             # the opaque broker correlation retained for observability.
@@ -350,9 +381,17 @@ class BrokerSubmissionCoordinator:
         stage: PipelineStage,
         video: Video,
         summary: str,
+        *,
+        finalize_stage: bool = True,
+        on_completed: Callable[[str], None] | None = None,
     ) -> BrokerSubmissionOutcome:
-        video.summary = summary
-        stage.status = "completed"
+        if on_completed is not None:
+            on_completed(summary)
+        if finalize_stage:
+            video.summary = summary
+            stage.status = "completed"
+        else:
+            stage.status = STATUS_PENDING_RETRY
         stage.last_error = None
         stage.failure_class = None
         stage.failure_code = None
@@ -361,6 +400,9 @@ class BrokerSubmissionCoordinator:
         stage.reconciliation_status = None
         stage.next_reconcile_at = None
         stage.reconciliation_reason = None
+        if not finalize_stage:
+            stage.broker_task_id = None
+            stage.broker_idempotency_key = None
         session.flush()
         session.commit()
         return BrokerSubmissionOutcome(disposition="completed", summary=summary)

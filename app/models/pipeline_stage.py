@@ -31,6 +31,9 @@ class PipelineStage(TimestampMixin, Base):
     # Bounded, sanitized terminal facts for prior broker generations. Payloads
     # and provider bodies are never stored here.
     broker_submission_history: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
+    # Versioned, sanitized map-reduce progress. It contains offsets and
+    # validated partial outputs, never prompts, transcripts, task IDs, or keys.
+    broker_chunk_plan: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failure_class: Mapped[str | None] = mapped_column(String(50), nullable=True)

@@ -1,7 +1,7 @@
 from functools import lru_cache
 from urllib.parse import urlparse
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -81,6 +81,20 @@ class Settings(BaseSettings):
     # to direct inference; only the route resolver reads it, never runtime
     # validation and never the manual probe CLI.
     summary_route: str = Field(default="", alias="SUMMARY_ROUTE")
+    broker_chunking_enabled: bool = Field(default=False, alias="BROKER_CHUNKING_ENABLED")
+    broker_llm_context_tokens: int = Field(default=16_384, ge=2_048, alias="BROKER_LLM_CONTEXT_TOKENS")
+    broker_chunk_chars: int = Field(default=24_000, ge=1, alias="BROKER_CHUNK_CHARS")
+    broker_chunk_overlap_chars: int = Field(default=2_000, ge=0, alias="BROKER_CHUNK_OVERLAP_CHARS")
+    broker_max_chunks: int = Field(default=6, ge=1, alias="BROKER_MAX_CHUNKS")
+    broker_chars_per_token_estimate: float = Field(
+        default=4.0, ge=1.0, le=8.0, alias="BROKER_CHARS_PER_TOKEN_ESTIMATE"
+    )
+
+    @model_validator(mode="after")
+    def validate_broker_chunk_settings(self) -> "Settings":
+        if self.broker_chunk_overlap_chars >= self.broker_chunk_chars:
+            raise ValueError("BROKER_CHUNK_OVERLAP_CHARS must be smaller than BROKER_CHUNK_CHARS")
+        return self
 
     @property
     def normalized_telegram_bot_username(self) -> str:

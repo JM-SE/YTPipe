@@ -3,7 +3,7 @@ from __future__ import annotations
 from app.services.broker_errors import BrokerSummarizationError, broker_error
 from app.services.broker_gateway import AcceptedTask, BrokerOperation, BrokerResult, BrokerTaskClient
 from app.services.broker_profile import BrokerRequestProfile, load_y01_profile
-from app.services.broker_summary import validate_broker_output
+from app.services.broker_summary import validate_broker_output, validate_broker_partial_output
 from app.services.summarization import FINAL_SUMMARY_INSTRUCTIONS, SUMMARIZATION_SYSTEM_PROMPT
 from app.services.broker_idempotency import broker_idempotency_key
 from app.services.summarization_gateway import SummaryGatewayContext
@@ -47,18 +47,43 @@ class BrokerTrafficSummarizationService:
     def timeout_seconds(self) -> float:
         return self._client.timeout_seconds
 
+    @property
+    def max_tokens(self) -> int:
+        return self._profile.max_tokens
+
     def idempotency_key_for(self, transcript: str, context: SummaryGatewayContext) -> str:
         operation = self._operation(transcript)
         return broker_idempotency_key(context, operation)
 
-    def submit_task(self, transcript: str, *, context: SummaryGatewayContext) -> AcceptedTask:
+    def idempotency_key_for_operation(self, operation: BrokerOperation, context: SummaryGatewayContext) -> str:
+        return broker_idempotency_key(context, operation)
+
+    def operation_for(self, *, kind: str, ordinal: int, user_prompt: str) -> BrokerOperation:
+        return BrokerOperation(
+            kind,
+            ordinal,
+            SUMMARIZATION_SYSTEM_PROMPT,
+            user_prompt,
+            self._profile.max_tokens,
+        )
+
+    def submit_task(
+        self,
+        transcript: str,
+        *,
+        context: SummaryGatewayContext,
+        operation: BrokerOperation | None = None,
+        timeout: float | None = None,
+    ) -> AcceptedTask:
         """POST only. Return an accepted handle; the coordinator owns polling."""
         if context is None:
             raise broker_error("broker_context_missing")
-        operation = self._operation(transcript)
+        operation = operation or self._operation(transcript)
         self._assert_request_size(operation)
         try:
-            accepted = self._client.submit_task(operation, broker_idempotency_key(context, operation))
+            accepted = self._client.submit_task(
+                operation, broker_idempotency_key(context, operation), timeout=timeout
+            )
         except BrokerSummarizationError:
             raise
         except Exception:
@@ -76,6 +101,7 @@ class BrokerTrafficSummarizationService:
         *,
         idempotency_key_value: str,
         timeout: float | None = None,
+        operation_kind: str | None = None,
     ) -> str | None:
         """Single GET result poll; None while the task is still pending."""
         try:
@@ -90,7 +116,7 @@ class BrokerTrafficSummarizationService:
             ) from None
         if result is None:
             return None
-        return self._validated_result(result)
+        return self._validated_result(result, partial=operation_kind == "traffic_partial")
 
     def summarize(self, transcript: str, *, context: SummaryGatewayContext | None = None) -> str:
         """Legacy blocking convenience (probes/tests only).
@@ -112,12 +138,18 @@ class BrokerTrafficSummarizationService:
             raise broker_error("broker_error") from None
         return self._validated_result(result)
 
-    def reconcile(self, task_id: str, *, idempotency_key: str | None = None) -> str | None:
+    def reconcile(
+        self,
+        task_id: str,
+        *,
+        idempotency_key: str | None = None,
+        operation_kind: str | None = None,
+    ) -> str | None:
         """Reconcile an operator-resolved task using GET only."""
         result = self._client.reconcile_result(task_id, idempotency_key=idempotency_key)
         if result is None:
             return None
-        return self._validated_result(result)
+        return self._validated_result(result, partial=operation_kind == "traffic_partial")
 
     def _operation(self, transcript: str) -> BrokerOperation:
         return BrokerOperation(
@@ -133,12 +165,13 @@ class BrokerTrafficSummarizationService:
         if request_bytes > self._profile.max_request_content_bytes:
             raise broker_error("broker_input_too_large")
 
-    def _validated_result(self, result: BrokerResult) -> str:
+    def _validated_result(self, result: BrokerResult, *, partial: bool = False) -> str:
         if result.finish_reason != self._profile.accepted_finish_reason:
             if result.finish_reason == "length":
                 raise broker_error("broker_output_incomplete")
             raise broker_error("broker_output_invalid")
         try:
-            return validate_broker_output(result.content)
+            validator = validate_broker_partial_output if partial else validate_broker_output
+            return validator(result.content)
         except ValueError:
             raise broker_error("broker_output_invalid") from None
