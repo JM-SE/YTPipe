@@ -46,7 +46,11 @@ def test_direct_summary_requests_structured_evidence_based_output(monkeypatch) -
     assert service.summarize("Una transcripcion breve sobre un tema importante.") == "structured summary"
     assert len(prompts) == 1
     assert FINAL_SUMMARY_INSTRUCTIONS in prompts[0]
-    assert "250 y 350 palabras" in prompts[0]
+    assert "sin cantidad mínima ni máxima" in prompts[0]
+    assert "Cada dato o afirmación debe aparecer una sola vez" in prompts[0]
+    assert "Si no aporta nada nuevo, omite esta sección" in prompts[0]
+    assert "condiciones y excepciones" in prompts[0]
+    assert "250" not in prompts[0]
     assert "TRANSCRIPCION:" in prompts[0]
 
 
@@ -59,8 +63,9 @@ def test_summary_system_prompt_allows_bullets_and_requires_source_fidelity() -> 
 
 
 def test_partial_summary_prompt_requests_compact_notes_without_conclusion() -> None:
-    assert "5 y 8 bullets" in PARTIAL_SUMMARY_INSTRUCTIONS
-    assert "180 palabras" in PARTIAL_SUMMARY_INSTRUCTIONS
+    assert "sin cantidad mínima ni máxima" in PARTIAL_SUMMARY_INSTRUCTIONS
+    assert "sin cuotas rígidas de palabras" in PARTIAL_SUMMARY_INSTRUCTIONS
+    assert "grado de certeza" in PARTIAL_SUMMARY_INSTRUCTIONS
     assert "conclusión propia" in PARTIAL_SUMMARY_INSTRUCTIONS
     assert "RESUMEN" not in PARTIAL_SUMMARY_INSTRUCTIONS
 

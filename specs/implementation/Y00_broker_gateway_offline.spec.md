@@ -105,10 +105,15 @@ Validation runs only on successful broker text. It returns the normalized broker
 2. Apply Unicode `strip()` to the whole value; remove trailing spaces/tabs from each line. Do not collapse internal spaces or blank lines.
 3. Reject empty output and case-insensitive occurrences of `<think` or `</think>` anywhere.
 4. Reject any line whose optional leading whitespace is followed by a Markdown heading marker (`#`), a three-backtick or `~~~` fence, or a numbered-list prefix (`1. ` or `1) ` pattern).
-5. Require heading lines exactly `RESUMEN`, `PUNTOS CLAVE`, and `CONCLUSIÓN`, in that order, each exactly once and alone on its line. Leading whitespace, punctuation, or case variation is invalid.
+5. Require heading lines exactly `RESUMEN` and `PUNTOS CLAVE`, in that order, each exactly once and alone on its line. `CONCLUSIÓN` is optional; when present it must appear exactly once after the points. Leading whitespace, punctuation, or case variation is invalid.
 6. Treat any other all-uppercase, letters/spaces-only line as an extra top-level heading and reject it.
-7. Require at least one non-blank line in `RESUMEN` and `CONCLUSIÓN`.
-8. In `PUNTOS CLAVE`, require exactly 4–7 non-blank lines; every one must begin with `•` in column zero and contain non-whitespace text after the bullet.
+7. Require at least one non-blank line in `RESUMEN` and in `CONCLUSIÓN` when that optional section is present.
+8. In `PUNTOS CLAVE`, require a nonempty bullet list without a fixed count limit; every non-blank line must begin with `•` in column zero and contain non-whitespace text after the bullet.
+
+The adaptive output contract in `specs/summary_output_format.spec.md` supersedes
+the original fixed bullet counts and mandatory conclusion. Existing valid output
+remains accepted. Intermediate notes likewise require a nonempty bullet list
+without fixed count limits, retaining think-tag rejection and whitespace normalization.
 
 Exact valid fixture:
 
@@ -126,7 +131,7 @@ CONCLUSIÓN
 Conclusión fiel.
 ```
 
-Invalid fixture families must pin: empty/whitespace; either think-tag form and mixed case; missing, duplicate, reordered, indented, punctuated, or case-changed headings; empty section; 3 or 8 bullets; indented/empty/non-bullet point; Markdown heading/fence; numbered list; extra uppercase top-level heading. Add one normalization fixture proving CRLF, outer whitespace, and trailing spaces normalize exactly while internal blank lines/spaces are retained.
+Invalid fixture families must pin: empty/whitespace; either think-tag form and mixed case; missing, duplicate, reordered, indented, punctuated, or case-changed headings; empty required section or present-but-empty conclusion; empty point list; indented/empty/non-bullet point; Markdown heading/fence; numbered list; extra uppercase top-level heading. Add one normalization fixture proving CRLF, outer whitespace, and trailing spaces normalize exactly while internal blank lines/spaces are retained.
 
 Spanish/source fidelity and non-invention remain prompt, characterization, and later evaluation expectations; they are not claimed as mechanically provable validator assertions.
 

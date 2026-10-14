@@ -329,8 +329,6 @@ def test_reconcile_result_returns_success_without_post() -> None:
 
 @pytest.mark.parametrize("value", [
     "", "  ", "a <think>x", "a </THINK>",
-    "RESUMEN\nR\nPUNTOS CLAVE\n• a\n• b\n• c\nCONCLUSIÓN\nC",  # 3 bullets
-    "RESUMEN\nR\nPUNTOS CLAVE\n" + "\n".join(f"• {i}" for i in range(8)) + "\nCONCLUSIÓN\nC",  # 8
     " RESUMEN\nR\nPUNTOS CLAVE\n• a\n• b\n• c\n• d\nCONCLUSIÓN\nC",  # indented
     "RESUMEN:\nR\nPUNTOS CLAVE\n• a\n• b\n• c\n• d\nCONCLUSIÓN\nC",  # punctuated
     "resumen\nR\nPUNTOS CLAVE\n• a\n• b\n• c\n• d\nCONCLUSIÓN\nC",  # case changed

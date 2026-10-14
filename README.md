@@ -57,8 +57,10 @@ detection → baseline or new video → transcript → summary → notify
    failure states. If a stage keeps failing, you get an explicit fallback
    message stating the reason instead of silence.
 4. **Summary.** A small local instruction model served by llama.cpp writes a
-   Spanish summary (`RESUMEN` → `PUNTOS CLAVE` → `CONCLUSIÓN`, evidence-based,
-   no filler). Long transcripts are chunked and re-synthesized.
+   Spanish summary (`RESUMEN` → `PUNTOS CLAVE`, with `CONCLUSIÓN` only when
+   it adds information). Length and bullet count adapt to relevant content;
+   facts and qualifiers are preserved without repetition or filler. Long
+   transcripts are chunked into factual notes and re-synthesized.
 5. **On demand.** Message `/summary <youtube-url>` to the Telegram bot and a
    long-polling listener queues the request in PostgreSQL; the same pipeline
    processes it and replies in your private chat. No webhook, no public
