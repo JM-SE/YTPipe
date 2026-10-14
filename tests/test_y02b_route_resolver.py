@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -75,10 +76,24 @@ def test_resolve_summary_route(value: str | None, expected: str) -> None:
     assert resolve_summary_route(value) == expected
 
 
+@pytest.fixture(autouse=True)
+def _isolate_settings_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Keep these offline tests independent of the operator's process environment.
+    names = {name.casefold() for name in Settings.model_fields}
+    names.update(
+        field.alias.casefold()
+        for field in Settings.model_fields.values()
+        if isinstance(field.alias, str)
+    )
+    for name in list(os.environ):
+        if name.casefold() in names:
+            monkeypatch.delenv(name)
+
+
 def _base_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {"DATABASE_URL": "sqlite://"}
     values.update(overrides)
-    return Settings(**values)  # type: ignore[arg-type]
+    return Settings(_env_file=None, **values)  # type: ignore[arg-type]
 
 
 def test_helper_defaults_to_direct_with_single_attribution_record(caplog: pytest.LogCaptureFixture) -> None:
@@ -105,7 +120,7 @@ def _broker_settings(**overrides: object) -> Settings:
         "BROKER_BEARER_TOKEN": "h03-test-token-abc123",
     }
     values.update(overrides)
-    return Settings(**values)  # type: ignore[arg-type]
+    return Settings(_env_file=None, **values)  # type: ignore[arg-type]
 
 
 def test_helper_broker_builds_traffic_service_without_network(caplog: pytest.LogCaptureFixture) -> None:
