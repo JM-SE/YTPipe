@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import requests
+
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import InvalidVideoId, NoTranscriptFound, TranscriptsDisabled
 
@@ -11,6 +13,16 @@ from app.core.settings import Settings
 logger = logging.getLogger(__name__)
 
 DEFAULT_LANGUAGES = ["es", "en"]
+CONNECT_TIMEOUT_SECONDS = 10
+READ_TIMEOUT_SECONDS = 30
+
+
+def _request_with_timeout(request):
+    def bounded_request(*args, **kwargs):
+        kwargs.setdefault("timeout", (CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS))
+        return request(*args, **kwargs)
+
+    return bounded_request
 
 
 @dataclass(frozen=True)
@@ -30,7 +42,9 @@ class TranscriptFetchResult:
 
 class TranscriptService:
     def __init__(self, settings: Settings):  # noqa: ARG002
-        self._api = YouTubeTranscriptApi()
+        session = requests.Session()
+        session.request = _request_with_timeout(session.request)
+        self._api = YouTubeTranscriptApi(http_client=session)
 
     def fetch_transcript(self, youtube_video_id: str) -> str | None:
         return self.fetch_transcript_result(youtube_video_id).text

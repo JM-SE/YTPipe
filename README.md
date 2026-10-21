@@ -207,6 +207,9 @@ Per-repo workflow rules are in `AGENTS.md`.
   unit files.
 - Single execution lock guards polling and pipeline startup batches against
   overlap; Telegram long polling allows exactly one consumer per bot.
+- Transcript HTTP requests use 10-second connect and 30-second read inactivity
+  timeouts. The read timeout is not a total fetch deadline; retries remain
+  governed by the existing pipeline policy.
 - Broker changes are gated: connectivity acceptance passed on a disposable
   stack; any production canary needs separate operational approval and full
   broker/YTPipe/Telegram reconciliation, with `direct` as the explicit
