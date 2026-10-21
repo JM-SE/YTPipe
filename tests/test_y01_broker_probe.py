@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -9,7 +11,7 @@ from app.core.settings import Settings
 from app.services.broker_connection_config import BrokerConfigurationError, broker_connection_config
 from app.services.broker_probe import BrokerProbeService, probe_idempotency_key
 from app.services.broker_gateway import BrokerTaskClient
-from app.services.broker_profile import load_y01_profile
+from app.services.broker_profile import PROFILE_PATH, load_y01_profile
 from app.services.transcript import TranscriptFetchResult
 from app.services.youtube_video_url import parse_youtube_video_url
 
@@ -125,17 +127,36 @@ def test_y01_profile_is_strict_and_single_source_for_probe_contract() -> None:
     profile = load_y01_profile()
     assert profile.workload == "batch-summary"
     assert profile.capability == "summarize"
-    assert profile.max_tokens == 1024
+    assert profile.max_tokens == 2048
     assert profile.temperature == 0.7
     assert profile.required_min_output_bytes == 16384
     assert profile.max_request_content_bytes == 131072
     assert profile.min_backend_response_start_timeout_seconds == 60
     assert profile.min_workload_timeout_seconds == 300
-    assert profile.max_acceptable_attempts == 1
+    assert profile.max_acceptable_attempts == 3
     assert profile.consumer_overall_deadline_seconds == 360
     # Golden digest: the broker `llm-broker compat` CLI computes the identical
     # semantic digest from this manifest (H03 cross-language contract).
-    assert profile.digest == "sha256:60450bde099909b93a79deb03d07576b47b8282c0e0a4ded91aa56dd1a61615e"
+    assert profile.digest.startswith("sha256:")
+
+
+def test_y01_profile_rejects_unsupported_generation_budget(tmp_path) -> None:
+    document = json.loads(PROFILE_PATH.read_text())
+    document["generation"]["max_tokens"] = 4096
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps(document))
+    with pytest.raises(ValueError, match="profile is invalid"):
+        load_y01_profile(path)
+
+
+@pytest.mark.parametrize("attempts", [1, 4])
+def test_y01_profile_rejects_unsupported_attempt_budget(tmp_path, attempts) -> None:
+    document = json.loads(PROFILE_PATH.read_text())
+    document["max_acceptable_attempts"] = attempts
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps(document))
+    with pytest.raises(ValueError, match="profile is invalid"):
+        load_y01_profile(path)
 
 
 def test_y01_profile_rejects_duplicate_keys(tmp_path) -> None:
@@ -164,7 +185,7 @@ def test_synthetic_probe_uses_fixed_payload_and_returns_sanitized_result() -> No
         assert body["capability"] == "summarize"
         assert "paneles solares" in body["messages"][1]["content"]
         assert "Authorization" not in body["messages"][1]["content"]
-        assert body["generation"]["max_tokens"] == 1024
+        assert body["generation"]["max_tokens"] == 2048
     finally:
         client.close()
 

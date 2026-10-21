@@ -9,6 +9,10 @@ connectivity gate, not product broker activation. It depends on
 accepted Y00 commit `ff05558` and does not redefine Y00. YTPipe baseline
 `8ae6aa5` is context, not acceptance evidence.
 
+## Approved runtime amendment (2026-10-21)
+
+The accepted Y01 manifest value `max_tokens=1024` above is historical acceptance evidence and is not rewritten. The current approved YTPipe consumer manifest raises `generation.max_tokens` to 2048 and aligns `max_acceptable_attempts` to the broker's existing three-attempt policy, with matching strict loader pins. The latter records the current operational limit; it does not increase broker retries or change YTPipe stage counters. Temperature, response format and stop-only completion acceptance remain unchanged. This amendment changes the shared YTPipe consumer contract for traffic and probes; it does not itself apply or verify external broker policy, activate a route, or authorize operational rollout. The direct llama.cpp default remains 1024. See `specs/broker_output_budget_measurement.spec.md` for the pre-change baseline and measurement method.
+
 ## Context
 
 Y01 proves broker connectivity, authentication, policy/protocol compliance, and

@@ -100,6 +100,7 @@ def test_helper_defaults_to_direct_with_single_attribution_record(caplog: pytest
     with caplog.at_level(logging.INFO, logger="app.services.summary_route"):
         service = build_routed_summarization_gateway(_base_settings(), root="startup")
     assert isinstance(service, DirectSummarizationGateway)
+    assert _base_settings().llama_cpp_max_tokens == 1024
     assert caplog.text.count("summary_route_resolved") == 1
     assert "route=direct" in caplog.text
     assert "root=startup" in caplog.text
@@ -207,7 +208,7 @@ def test_traffic_success_returns_summary_with_stable_stage_key() -> None:
     assert all(
         body["workload"] == "batch-summary"
         and body["capability"] == "summarize"
-        and body["generation"] == {"max_tokens": 1024, "temperature": 0.7}
+        and body["generation"] == {"max_tokens": 2048, "temperature": 0.7}
         for body in bodies
     )
     keys = [request.headers["Idempotency-Key"] for request in seen]

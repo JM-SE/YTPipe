@@ -21,6 +21,11 @@ def test_context_and_chunk_size_are_configurable() -> None:
     text = "palabra " * 9_500
     assert build_plan(text, BrokerChunkConfig(enabled=True)) is not None
     assert build_plan(text, BrokerChunkConfig(enabled=True, context_tokens=32_768)) is None
+    broker_config = BrokerChunkConfig(enabled=True, max_tokens=2048)
+    plan = build_plan(text, broker_config)
+    assert plan is not None
+    assert plan["config"]["max_tokens"] == 2048
+    assert BrokerChunkConfig().max_tokens == 1024
 
 
 def test_plan_is_bounded_and_fingerprinted() -> None:

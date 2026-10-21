@@ -113,14 +113,14 @@ def _validate_document(document: Any) -> None:
         or document["api_range"] != ">=0.1.1 <0.2.0"
         or document["workload"] != "batch-summary"
         or document["capability"] != "summarize"
-        or generation["max_tokens"] != 1024
+        or generation["max_tokens"] != 2048
         or generation["temperature"] != 0.7
         or response["kind"] != "text"
         or document["max_request_content_bytes"] != 131072
         or document["required_min_output_bytes"] != 16384
         or document["min_workload_timeout_seconds"] != 300
         or document["min_backend_response_start_timeout_seconds"] != 60
-        or document["max_acceptable_attempts"] != 1
+        or document["max_acceptable_attempts"] != 3
         or document["consumer_overall_deadline_seconds"] != 360
     ):
         raise ValueError("Broker consumer profile is invalid.")
