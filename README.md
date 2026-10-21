@@ -210,6 +210,13 @@ Per-repo workflow rules are in `AGENTS.md`.
 - Transcript HTTP requests use 10-second connect and 30-second read inactivity
   timeouts. The read timeout is not a total fetch deadline; retries remain
   governed by the existing pipeline policy.
+- Broker output currently has a frozen 1024-token budget in
+  `app/contracts/broker/y01.consumer-compat.json`; `LLAMA_CPP_MAX_TOKENS`
+  does not change that route. A `length` finish reason means the output budget
+  was exhausted: YTPipe reports the token limit and keeps the failure terminal,
+  even at attempt 1 of 3 (the maximum is not a retry guarantee). Increasing the
+  budget requires coordinated consumer-profile and broker compatibility approval;
+  it does not automatically recover previously failed videos.
 - Broker changes are gated: connectivity acceptance passed on a disposable
   stack; any production canary needs separate operational approval and full
   broker/YTPipe/Telegram reconciliation, with `direct` as the explicit

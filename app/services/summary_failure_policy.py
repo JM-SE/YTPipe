@@ -110,7 +110,7 @@ def _display_reason(code: str) -> str:
         "broker_timeout": "El broker no confirmó el resultado dentro del plazo; requiere reconciliación.",
         "broker_transport_error": "No se pudo contactar al broker de forma segura.",
         "broker_task_indeterminate": "El resultado del broker es indeterminado y requiere resolución operativa.",
-        "broker_output_incomplete": "El broker devolvió una salida incompleta.",
+        "broker_output_incomplete": "El modelo alcanzó el límite de tokens de salida antes de completar el resumen.",
         "broker_output_invalid": "El broker devolvió una salida inválida.",
         "broker_input_too_large": "La entrada supera el límite aceptado por el broker.",
         "broker_protocol_error": "El broker devolvió una respuesta incompatible.",
