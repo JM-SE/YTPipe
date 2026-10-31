@@ -1,0 +1,20 @@
+# Actionable summary failure notice
+Objective: deliver the approved step 1 only, with verified activation and local main integration.
+Branch: fix/actionable-summary-failure-notice; base: 5645450; delivery: ask-on-risk, forecast ~200 authored lines; tests: `.venv/bin/python -m pytest`.
+
+## Specs
+S1. User: "Ok, por ahora solo hace el paso 1." Accepted step: "Ahora: mejorar el texto con datos que YTPipe ya conoce. Explicar que venció la espera, que el resultado todavía es desconocido y que los reintentos están suspendidos para evitar duplicados. Incluir el código de error y una referencia del video para investigarlo. Sacar el confuso ‘1 de 3’ cuando no habrá otro intento automático." No new broker diagnosis queries or retry changes.
+S2. User: "Por favor esto hacelo en una rama nueva, luego de hacerlo y verifica que esté todo bien y funcional, deploya los cambios y deja todo mergeado en main para hacer los push correspondientes." Local deployment and main integration only; do not push.
+
+## Tasks
+T1 | S1 | delegated context backstop | done | RED/GREEN observed by writer; focused 59 passed; commit: cbf911c. Risk: item 3, shared formatter callers.
+T2 | S1-S2 | independent verify plus parent suite | done | parent full suite 431 passed/1 packaging skip/3 warnings; independent S1 and source S2 met, no blockers; commit: cbf911c.
+T3 | S2 | inline operations | done | job-6 deployed cbf911c; independent S2 met; main fast-forward and parent health/status passed; commit: closing tracking commit. Risk: item 5, deployment.
+
+## Log
+L1. Ok, por ahora solo hace el paso 1. Por favor esto hacelo en una rama nueva, luego de hacerlo y verifica que esté todo bien y funcional, deploya los cambios y deja todo mergeado en main para hacer los push correspondientes.
+L2. Clean starting tree at 5645450, main is ancestor with only prior incident notice and tracking commits outstanding. Production API uses editable checkout /home/jmse/labs/YTPipe; source writes do not restart running process. New branch created before source writes. No changes to broker policy/config, persisted records or recovery behavior authorized. Scope is incident hardening, not a new numbered phase.
+L3. Writer completed S1, 59 focused tests passed after RED; parent corrected raw code emission and duplicate URL before verification. Unknown codes now use safe mapping fallback; retry outcomes unchanged, no-attempt denominators on nonretry notices. Native assess unavailable due untracked feature file, RDD off; independent verification required for shared callers.
+L4. Parent suite job-5:431 passed,1 skipped(packaging artifact absent),3 deprecation warnings. Independent verifier: S1/source S2 met,50 focused+36 independent checks passed; differential384 policy outcomes and unrelated fallback/manual replies identical except requested text. No blockers; no extra advisory tests added. Source/docs/tests committed cbf911c. Deployment authorized by S2; no push.
+L5. Deployment job-6 exit0 in49s: paused originally active poll monitor and Telegram listener, observed execution lock idle, restarted API exactly once (PID1059->763840), health200/status200 readytrue, restored both producers active. No broker restart/replay/config change. Native assess item5 unavailable because untracked feature document; RDD off. Independent operational verifier S2 met: source cbf911c, correct API checkout/PID, all three YTPipe units active, health200/status200 readytrue, unsent formatter sample verified. No blockers.
+L6. Local main fast-forwarded 174c843->cbf911c, including the prior incident's two unmerged commits 3040728/5645450. Parent post-integration GET health200ok and authenticated status200readytrue passed. Runtime code identical to tested/deployed source. Final tracking commit only; no meaningful RED for bookkeeping. No push, no artificial failure notification, no new diagnosis queries. Risk item3(shared formatters) and item5(deployment) independently verified. Skip: packaging smoke requires build artifact; 3 dependency deprecation warnings remain.
