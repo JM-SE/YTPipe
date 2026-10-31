@@ -443,10 +443,17 @@ def test_stale_reply_lease_keeps_canonical_failure_message(db_session, monkeypat
     failure message: after lease recovery the retry delivers the same canonical
     text, not the generic fallback."""
     _user, video = add_owner_and_video(db_session)
-    canonical = (
+    legacy_stored_message = (
         "Resumen no disponible.\n"
         "Motivo: El broker no confirmó el resultado dentro del plazo; requiere reconciliación.\n"
         "Estado: Quarantined: requiere resolución operativa antes de continuar."
+    )
+    canonical = (
+        "Resumen no disponible.\n"
+        "Motivo: El broker no confirmó el resultado dentro del plazo; requiere reconciliación.\n"
+        "Estado: La espera agotó el plazo; se desconoce si el broker completó el trabajo. "
+        "Los reintentos están suspendidos. Verifique el worker del broker y reconcilie "
+        "el resultado antes de continuar."
     )
     stage = PipelineStage(
         video_id=video.id,
@@ -464,7 +471,7 @@ def test_stale_reply_lease_keeps_canonical_failure_message(db_session, monkeypat
         reply_status="sending",
         video_id=video.id,
     )
-    request.last_error = canonical
+    request.last_error = legacy_stored_message
     request.reply_attempt_count = 1
     request.reply_started_at = datetime.now(UTC) - timedelta(seconds=5)
     request.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -498,7 +505,7 @@ def test_stale_reply_lease_keeps_canonical_failure_message(db_session, monkeypat
     stored = db_session.get(TelegramCommandRequest, request.id)
     # Lease recovery preserved the canonical message for the retry.
     assert stored.reply_status == "pending_retry"
-    assert stored.last_error == canonical
+    assert stored.last_error == legacy_stored_message
 
     stored.reply_next_attempt_at = datetime.now(UTC) - timedelta(seconds=1)
     db_session.commit()

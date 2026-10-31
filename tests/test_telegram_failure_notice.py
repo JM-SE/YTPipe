@@ -29,6 +29,36 @@ def test_context_failure_notice_includes_safe_reason_and_actual_attempts() -> No
     assert "request (18672 tokens)" not in message
 
 
+def test_broker_timeout_notice_explains_quarantine_for_fresh_and_persisted_failures() -> None:
+    outcome = classify_summary_failure(
+        route="broker",
+        code="broker_timeout",
+        attempt_count=1,
+        max_attempts=3,
+        now=datetime.now(UTC),
+    )
+    expected = (
+        "Resumen no disponible.\n"
+        "Motivo: El broker no confirmó el resultado dentro del plazo; requiere reconciliación.\n"
+        "Estado: La espera agotó el plazo; se desconoce si el broker completó el trabajo. "
+        "Los reintentos están suspendidos. Verifique el worker del broker y reconcilie el resultado antes de continuar.\n"
+        "Intentos realizados: 1 de 3."
+    )
+
+    assert format_summary_failure_notice(
+        outcome, attempt_count=1, max_attempts=3,
+    ) == expected
+    assert format_persisted_summary_failure(
+        failure_code="broker_timeout",
+        quarantined=True,
+        attempt_count=1,
+        max_attempts=3,
+    ) == expected
+    assert outcome.disposition == "quarantine"
+    assert outcome.retry_at is None
+    assert outcome.recovery_action == "broker_resolve"
+
+
 def test_incomplete_output_notice_explains_token_limit_without_promising_retry() -> None:
     outcome = classify_summary_failure(
         route="broker",

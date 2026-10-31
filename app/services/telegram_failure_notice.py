@@ -12,7 +12,13 @@ def format_summary_failure_notice(
 ) -> str:
     prefix = f"Video: {title}\n" if title else ""
     if outcome.disposition == "quarantine":
-        state = "Quarantined: requiere resolución operativa antes de continuar."
+        state = (
+            "La espera agotó el plazo; se desconoce si el broker completó el trabajo. "
+            "Los reintentos están suspendidos. Verifique el worker del broker y reconcilie "
+            "el resultado antes de continuar."
+            if outcome.failure_code == "broker_timeout"
+            else "Quarantined: requiere resolución operativa antes de continuar."
+        )
     elif outcome.disposition == "retry":
         state = "Se reintentará automáticamente con backoff."
     else:
@@ -39,7 +45,13 @@ def format_persisted_summary_failure(
 ) -> str:
     """Format a persisted stage failure without relying on free-form text."""
     state = (
-        "Quarantined: requiere resolución operativa antes de continuar."
+        (
+            "La espera agotó el plazo; se desconoce si el broker completó el trabajo. "
+            "Los reintentos están suspendidos. Verifique el worker del broker y reconcilie "
+            "el resultado antes de continuar."
+            if failure_code == "broker_timeout"
+            else "Quarantined: requiere resolución operativa antes de continuar."
+        )
         if quarantined
         else "No se reintentará automáticamente."
     )
