@@ -1429,14 +1429,14 @@ class PipelineService:
             ).scalars().all()
             stage_map = {s.stage: s for s in all_stages}
 
-        reason = self._build_fallback_reason(stage_map)
+        video_url = f"https://www.youtube.com/watch?v={video.youtube_video_id}"
+        reason = self._build_fallback_reason(stage_map, video_reference=video_url)
         if reason is None:
             fallback_stage.status = STATUS_COMPLETED
             return False
 
         title = video.title or video.youtube_video_id
         channel_title = channel.title or "Canal desconocido"
-        video_url = f"https://www.youtube.com/watch?v={video.youtube_video_id}"
         summary_stage = stage_map.get(STAGE_SUMMARY)
         if summary_stage is not None and (
             summary_stage.status == STATUS_FAILED or summary_stage.quarantined_at is not None
@@ -1457,8 +1457,8 @@ class PipelineService:
                 display_reason=format_summary_failure_code(summary_stage.failure_code),
             )
             message = (
-                f"{format_summary_failure_notice(outcome, title, attempt_count=summary_stage.attempt_count, max_attempts=summary_stage.max_attempts)}\n"
-                f"Canal: {channel_title}\nURL: {video_url}\n"
+                f"{format_summary_failure_notice(outcome, title, attempt_count=summary_stage.attempt_count, max_attempts=summary_stage.max_attempts, video_reference=video_url)}\n"
+                f"Canal: {channel_title}\n"
                 f"Causa: {format_summary_failure_code(summary_stage.failure_code)}"
             )
         else:
@@ -1633,6 +1633,8 @@ class PipelineService:
     def _build_fallback_reason(
         self,
         stage_map: dict[str, PipelineStage],
+        *,
+        video_reference: str | None = None,
     ) -> str | None:
         for stage_name in (STAGE_TRANSCRIPT, STAGE_SUMMARY, STAGE_TELEGRAM):
             stage = stage_map.get(stage_name)
@@ -1663,6 +1665,7 @@ class PipelineService:
                         outcome,
                         attempt_count=stage.attempt_count,
                         max_attempts=stage.max_attempts,
+                        video_reference=video_reference,
                     )
                 reason = FALLBACK_REASON_SUMMARY.format(max_attempts=stage.max_attempts)
                 specific = format_summary_failure_code(stage.failure_code)
@@ -1680,6 +1683,7 @@ class PipelineService:
                     outcome,
                     attempt_count=stage.attempt_count,
                     max_attempts=stage.max_attempts,
+                    video_reference=video_reference,
                 )
                 return notice
             if stage_name == STAGE_TELEGRAM:

@@ -592,6 +592,10 @@ class TelegramCommandQueueService:
                     quarantined=stage.quarantined_at is not None,
                     attempt_count=stage.attempt_count,
                     max_attempts=stage.max_attempts,
+                    video_reference=(
+                        f"https://www.youtube.com/watch?v={request.video.youtube_video_id}"
+                        if request.video is not None else None
+                    ),
                 )
             return "No se pudo completar el resumen de este video."
         return "No se pudo completar la solicitud."

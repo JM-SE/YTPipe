@@ -55,7 +55,11 @@ detection → baseline or new video → transcript → summary → notify
 3. **Pipeline.** Each new video flows through durable stages —
    `transcript` → `summary` → `telegram` — with per-stage retry, skip, and
    failure states. If a stage keeps failing, you get an explicit fallback
-   message stating the reason instead of silence.
+   message stating the reason instead of silence. Summary failure notices use a
+   stable safe diagnostic code and a public YouTube video reference; broker
+   timeouts are described as an unknown result with retries suspended to avoid
+   duplicates and operator reconciliation required. They do not expose broker
+   task/idempotency identifiers or raw provider errors.
 4. **Summary.** A small local instruction model served by llama.cpp writes a
    Spanish summary (`RESUMEN` → `PUNTOS CLAVE`, with `CONCLUSIÓN` only when
    it adds information). Length and bullet count adapt to relevant content;

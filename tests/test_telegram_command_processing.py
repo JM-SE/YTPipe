@@ -429,6 +429,8 @@ def test_quarantined_summary_command_terminalizes_once_with_canonical_reply(db_s
     message = calls[0]
     assert "Resumen no disponible" in message
     assert "requiere reconciliación" in message
+    assert "Código: broker_timeout" in message
+    assert f"Video: https://www.youtube.com/watch?v={video.youtube_video_id}" in message
     assert "opaque" not in message
     assert "t-1" not in message
 
@@ -449,11 +451,13 @@ def test_stale_reply_lease_keeps_canonical_failure_message(db_session, monkeypat
         "Estado: Quarantined: requiere resolución operativa antes de continuar."
     )
     canonical = (
+        f"Video: https://www.youtube.com/watch?v={video.youtube_video_id}\n"
         "Resumen no disponible.\n"
         "Motivo: El broker no confirmó el resultado dentro del plazo; requiere reconciliación.\n"
         "Estado: La espera agotó el plazo; se desconoce si el broker completó el trabajo. "
-        "Los reintentos están suspendidos. Verifique el worker del broker y reconcilie "
-        "el resultado antes de continuar."
+        "Los reintentos están suspendidos para evitar duplicados. "
+        "Un operador debe revisar el worker del broker y recuperar el resultado de la tarea existente antes de habilitar nuevos intentos.\n"
+        "Código: broker_timeout"
     )
     stage = PipelineStage(
         video_id=video.id,

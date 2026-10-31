@@ -507,7 +507,10 @@ class TestDependencyChain:
         telegram.send_message.assert_called_once()
         message = telegram.send_message.call_args.args[0]
         assert "Resumen no disponible" in message
-        assert "broker_timeout" not in message
+        assert "Código: broker_timeout" in message
+        assert f"Video: https://www.youtube.com/watch?v={video.youtube_video_id}" in message
+        assert message.count(f"https://www.youtube.com/watch?v={video.youtube_video_id}") == 1
+        assert "broker_timeout" in message
         assert "task" not in message.lower()
         assert "internal.example" not in message
 
@@ -778,7 +781,8 @@ class TestFallbackTelegram:
 
         assert stats.fallbacks_sent == 1
         call = telegram_service.send_message.call_args
-        assert "Intentos realizados: 3 de 3." in call[0][0]
+        assert "Intentos realizados: 3 de 3." not in call[0][0]
+        assert "Código: summary_failure" in call[0][0]
         assert "Causa: El resumen no pudo generarse por un error controlado." in call[0][0]
 
     def test_fallback_reason_telegram(self, db_session, user, channel, video,
